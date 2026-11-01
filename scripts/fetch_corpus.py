@@ -328,12 +328,38 @@ def write_doc(src: Source, url: str, title: str, md: str, force: bool) -> dict |
         "doc_hash": digest,
         "fetched_at": stamp,
     }
-    with (out_dir / "index.jsonl").open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
+    upsert_index(out_dir, meta)
     return meta
 
 
-def run(src: Source, crawler: Crawler, *, limit: int | None, dry_run: bool, force: bool) -> dict:
+def upsert_index(out_dir: Path, meta: dict) -> None:
+    """写或更新 index.jsonl 里该 slug 的一行：--force 重抓不会产生重复行。"""
+    path = out_dir / "index.jsonl"
+    kept: list[str] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # 半截行（上次中断）直接丢
+            if row.get("slug") != meta["slug"]:
+                kept.append(line)
+    kept.append(json.dumps(meta, ensure_ascii=False))
+    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+
+def run(
+    src: Source,
+    crawler: Crawler,
+    *,
+    limit: int | None,
+    dry_run: bool,
+    force: bool,
+    only: set[str] | None = None,
+) -> dict:
     stats = {"source": src.name, "found": 0, "saved": 0, "skipped": 0, "failed": 0, "chars": 0}
     try:
         urls = crawler.discover(src)
@@ -341,6 +367,11 @@ def run(src: Source, crawler: Crawler, *, limit: int | None, dry_run: bool, forc
         log(f"  ! {src.name}: 发现阶段失败 {type(exc).__name__}: {safe_str(str(exc))}")
         stats["failed"] += 1
         return stats
+    if only:
+        urls = [u for u in urls if slugify(u) in only or u in only]
+        if not urls:
+            log(f"  ! {src.name}: --only 未匹配到 URL（按 slug 或完整 URL 比对）")
+            return stats
     if limit:
         urls = urls[:limit]
     stats["found"] = len(urls)
@@ -394,6 +425,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--delay", type=float, default=1.0, help="请求间隔秒，最低 0.5")
     ap.add_argument("--dry-run", action="store_true", help="只列出将要抓取的 URL")
     ap.add_argument("--force", action="store_true", help="已存在的文件也重新抓取")
+    ap.add_argument(
+        "--only",
+        default=None,
+        help="只处理这些篇：逗号分隔的 slug 或完整 URL（配合 --force 修单篇）",
+    )
     args = ap.parse_args(argv)
 
     names = list(SOURCES) if args.source == "all" else [s.strip() for s in args.source.split(",") if s.strip()]
@@ -402,10 +438,20 @@ def main(argv: list[str] | None = None) -> int:
         log(f"未知源: {', '.join(unknown)}；可用: {', '.join(SOURCES)}")
         return 2
 
+    only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
     crawler = Crawler(delay=args.delay)
     results = []
     for name in names:
-        results.append(run(SOURCES[name], crawler, limit=args.limit, dry_run=args.dry_run, force=args.force))
+        results.append(
+            run(
+                SOURCES[name],
+                crawler,
+                limit=args.limit,
+                dry_run=args.dry_run,
+                force=args.force,
+                only=only,
+            )
+        )
 
     log("\n" + "=" * 58)
     log(f"{'源':<8}{'候选':>6}{'新增':>6}{'跳过':>6}{'失败':>6}{'总字数':>9}")
