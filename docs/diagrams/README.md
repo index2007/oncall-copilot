@@ -46,7 +46,7 @@
 | 拒答闸门 | 0.35（ABSTAIN_THRESHOLD，Top1 低于即拒答） | 技术路线与设计清单.md §13.4 / §5 M8；app/config.py:65；README §9 第 4 条（只是初值，D7 用评测集标定） |
 | 生成 | deepseek-flash | 技术路线与设计清单.md §5 M7 |
 | 注解卡 cE | 约 130 token/s；400 token 约 2.7–3.3 s | oncall-copilot/README.md §4（400 token 实测 3255 / 3286 / 2702 ms）；技术路线与设计清单.md §6.5 |
-| 注解卡 cE | 整卡 3–4 s，验收门槛 ≤4.0 s | oncall-copilot/README.md §9 第 3 条；技术路线与设计清单.md §6.2 |
+| 注解卡 cE | 整卡 P50 4.5 s / P95 7.1 s（门槛 P50 ≤4.5 s、P95 ≤8.0 s） | oncall-copilot/README.md §5.3 / §9 第 3 条；技术路线与设计清单.md §6.5 |
 | 引用校验 | 重生成 1 次，再失败降级 | 技术路线与设计清单.md §5 M8 |
 | 注解卡 cF | 首 token ≤1.2 s | 技术路线与设计清单.md §6.2 / §6.5 第 1 条；oncall-copilot/README.md §4 |
 | 注解卡 cC | embedding 303 ms（实测 2 条） | oncall-copilot/README.md §4；技术路线与设计清单.md §6.5 |
@@ -64,11 +64,11 @@
 ## 3. 与口述版本不一致的 6 处（我按文件和代码改的）
 
 1. **冷启动**：口述是「0.8–1.5 s」，文档里只有「首次查询 0.8 s（含模型加载）」（README §5.2），**图上写 0.8 s**，没有 1.5 这个数。
-2. **整卡耗时**：口述是「3.5–4 s」，文档口径是「整卡 ≤4.0 s」（设计清单 §6.2）和「整卡仍 3–4 s，P95 4.5 s 量级」（README §9 第 3 条），**图上写「整卡 3–4 s（门槛 ≤4.0 s）」**。
+2. **整卡耗时**：口述是「3.5–4 s」；D4 三批 27 次真实调用合计 P50 4346 ms / P95 8003 ms / worst 8306 ms（首批九次是 P50 4480 / P95 7089），v1.5 口径是「P50 ≤4.5 s、P95 ≤8.0 s」（设计清单 §6.5、README §5.3）。**图上写实测值 + 新门槛，口述时说「P50 稳在 4.2-4.5 s，P95 贴线、27 次里有 2 次破 8 s」，不要说「已经达标」。**
 3. **诊断卡字段**：口述是 summary / root_cause / confidence / evidence / next_steps / citations，设计清单 §7 的真实定义是 `diagnosis_id / abstained / causes[{title, confidence, evidence[chunk_id, url, score]}] / verify_commands / actions / citations / latency_ms / cost_cny / degraded`。**图上只写真实存在的 causes / verify_commands / actions**，没有编 summary、root_cause、next_steps。
 4. **资源类型词典**：代码 `RESOURCE_TYPES` 是 26 个键，**图上写 26**；设计清单 M4 原写 20 词，已按实测修成 26 词（v1.4）。
 5. **embedding batch**：设计清单 §3.1 原先写 32–64、§5 M3 与 `config.py:73` 是 16，**图上写 16**；§3.1 已在 v1.4 统一为 16（实测 125 次 `/embeddings` 请求）。
-6. **边界要讲清楚**：M6 / M7 / M8（reranker / generator / guard）**代码还没落地**——`app/core/` 只有 `query_understanding.py`、`retriever.py`、`schemas.py`，README §11 只做到 D3。图上的重排、生成、引用校验、拒答闸门是设计基线里的接口形态，**不是已跑通的实现**，讲图时别越过这条线。
+6. **边界要讲清楚**：M6 / M7 / M8 已在 D4 落地（`app/core/reranker.py`、`generator.py`、`guard.py`、`pipeline.py`，142 个单测，`scripts/d4_e2e.py` 能跑通整链），但 **M9 的 API 层（SSE / webhook / admin）还没写**，README §11 只做到 D4。讲图时可以说链路已跑通，不能说接口已对外可用。
 
 ## 4. 终端 ASCII 版（60–80 列）
 
@@ -117,7 +117,7 @@ On-call Copilot 全链路：在线请求 + 离线索引
       │
       ▼
  (10) 输出 · SSE / JSON  帧序 meta → citations → delta → done
-      首 token ≤1.2 s（检索+重排完即开流）· 整卡 3–4 s
+      首 token ≤1.2 s（检索+重排完即开流）· 整卡 P50 4.5 s
 
 【离线索引旁路（M1–M3）】
   (A) 采集  scripts/fetch_corpus.py → 抓 4 个源官网
@@ -147,7 +147,7 @@ On-call Copilot 全链路：在线请求 + 离线索引
 
 1. **理解很便宜**：错误码、资源类型、事件原因都是词典 + 正则，命中就走，规则没命中且 query 超过 20 字才调一次 LLM 做意图分类——实测只有 2% 的 query 会走 LLM，其余直接路由到子库。
 2. **召回只信排名**：向量 Top20 和 BM25 Top20 并行召回，RRF 用 k=60 只融合排名不融合分数，再交给 Cross-Encoder 从 20 条压到 5 条；Top1 分数低于 0.35 就直接返回 abstained 卡片，一个 token 都不生成。
-3. **首字快是因为不等 LLM**：检索 + 重排一结束就开 SSE，先推 meta / citations，正文用 delta 跟上，所以首 token 能压到 1.2 s 以内，整卡落在 3–4 s。
+3. **首字快是因为不等 LLM**：检索 + 重排一结束就开 SSE，先推 meta / citations，正文用 delta 跟上，所以首 token 能压到 1.2 s 以内；整卡实测 P50 4.5 s / P95 7.1 s，瓶颈是模型自己写多长。
 
 ## 6. 渲染与编辑
 

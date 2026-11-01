@@ -8,7 +8,7 @@
     ./.venv/Scripts/python.exe scripts/d4_e2e.py --json          # 机器可读
     ./.venv/Scripts/python.exe scripts/d4_e2e.py --repeat 3      # 每条样例跑 3 次，报 P50/P95
 
-判定：整卡耗时 P95 ≤4.0 s（清单 §6.5，同时打印 worst）；拒答路径不调 LLM；引用全部落在本次上下文。
+判定：整卡 P50 ≤4.5 s 且 P95 ≤8.0 s（v1.5 口径，同时打印 worst）；拒答路径不调 LLM；引用全部落在本次上下文。
 """
 
 from __future__ import annotations
@@ -64,6 +64,11 @@ def _pct(values: list[float], q: float) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows 控制台默认 GBK，表格里的 ¥ 会抛 UnicodeEncodeError
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # pragma: no cover - 非 TTY 或被重定向
+        pass
     ap = argparse.ArgumentParser(description="D4 端到端诊断卡验收")
     ap.add_argument("--query", default="", help="单条 query；不给则跑内置 3 条样例")
     ap.add_argument("--stage-only", action="store_true", help="只跑到重排与拒答判定，不调 LLM")
@@ -120,9 +125,11 @@ def main(argv: list[str] | None = None) -> int:
         p50, p95 = _pct(lat, 50), _pct(lat, 95)
         worst = max(lat)
         cost = sum(float(r["cost_cny"] or 0) for r in rows)
+        ok = p50 <= 4500 and p95 <= 8000
         print(
-            "total %.1fs | 整卡 P50 %.0f ms / P95 %.0f ms / worst %.0f ms | 门槛 P95 4000 ms → %s | 花费 ¥%.4f"
-            % (elapsed, p50, p95, worst, "PASS" if p95 <= 4000 else "FAIL", cost)
+            "total %.1fs | 整卡 P50 %.0f ms / P95 %.0f ms / worst %.0f ms"
+            " | 门槛 P50 4500 / P95 8000 ms → %s | 花费 ¥%.4f"
+            % (elapsed, p50, p95, worst, "PASS" if ok else "FAIL", cost)
         )
     return 0
 

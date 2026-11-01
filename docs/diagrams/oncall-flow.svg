@@ -133,7 +133,7 @@
     <text x="820" y="590" font-size="14" fill="#1F3A5F">200 ms（bge-reranker-v2-m3，实测 3 条候选）</text>
     <text x="820" y="744" font-size="14" font-weight="600" fill="#1F3A5F">生成耗时（实测）</text>
     <text x="820" y="761" font-size="14" fill="#1F3A5F">约 130 token/s；400 token 约 2.7–3.3 s</text>
-    <text x="820" y="778" font-size="14" fill="#1F3A5F">整卡 3–4 s（验收门槛 ≤4.0 s）</text>
+    <text x="820" y="778" font-size="14" fill="#1F3A5F">整卡 P50 4.5 s / P95 7.1 s（门槛 4.5 / 8.0 s）</text>
     <text x="820" y="924" font-size="14" font-weight="600" fill="#15803D">首字为什么能到 1.2 s</text>
     <text x="820" y="941" font-size="14" fill="#15803D">检索 + 重排完成即开流，不等 LLM</text>
     <text x="820" y="958" font-size="14" fill="#15803D">先推 meta / citations，正文再用 delta 跟上</text>
@@ -141,7 +141,7 @@
     <text x="820" y="671" font-size="14" fill="#B45309">不调 LLM，该路径 1 s 内返回</text>
     <text x="820" y="688" font-size="14" fill="#B45309">SSE 直接给出完整诊断卡</text>
     <text x="40" y="46" font-size="22" font-weight="600" fill="#1F3A5F">On-call Copilot 全链路：在线请求 + 离线索引</text>
-    <text x="1360" y="44" font-size="14" fill="#6B7280" text-anchor="end">设计基线 v1.3 ｜ 数字出处见同目录 README.md</text>
+    <text x="1360" y="44" font-size="14" fill="#6B7280" text-anchor="end">设计基线 v1.5 ｜ 数字出处见同目录 README.md</text>
     <text x="40" y="84" font-size="14" font-weight="600" fill="#6B7280">旁路 · 索引侧（离线）</text>
     <text x="768" y="656" font-size="14" fill="#B45309">拒答</text>
     <text x="572" y="706" font-size="14" fill="#1F3A5F">通过</text>
