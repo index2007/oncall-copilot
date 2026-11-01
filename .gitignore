@@ -8,6 +8,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 pytest-cache-files-*/
+jieba.cache
 
 # 密钥
 .env

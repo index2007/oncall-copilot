@@ -1,0 +1,53 @@
+%% On-call Copilot 全链路 —— 与 oncall-flow.svg 结构一致
+%% 主链路 = 在线请求（MAIN）；子图 IDX = 离线索引旁路（M1–M3）
+%% 渲染：mermaid-cli 或 VS Code 的 Markdown Preview Mermaid 插件
+
+flowchart TB
+  subgraph MAIN["在线请求主链路"]
+    direction TB
+    client["客户端 / 告警源<br/>HTTP 请求 · SSE 流式<br/>Alertmanager v4 webhook"]
+    api["API 层 · FastAPI（M9）<br/>路由 · 生命周期 · Pydantic 校验<br/>SSE 响应（sse-starlette）"]
+    qu["Query 理解（M4）· 规则优先<br/>错误码正则 6 类 · 资源类型 26 词<br/>事件原因 40 词 · 意图分类 → 子库路由"]
+    vec["向量召回<br/>LanceDB · bge-m3 · 1024 维<br/>Top20"]
+    bm25["BM25 召回<br/>jieba 分词 · rank_bm25<br/>Top20"]
+    rrf["RRF 融合（M5）<br/>score = Σ 1/(k + rank_i)，k = 60<br/>只信排名不信分数 → 输出 Top20"]
+    rerank["Cross-Encoder 重排（M6）<br/>bge-reranker-v2-m3<br/>Top20 → Top5"]
+    gate{"拒答闸门（M8）<br/>重排 Top1 分数低于 0.35 ?"}
+    gen["生成（M7）· deepseek-flash<br/>结构化诊断卡 JSON（Pydantic v2）<br/>causes · verify_commands · actions"]
+    cite["引用校验（M8）<br/>chunk_id 必须在本轮上下文<br/>失败重生成 1 次 → 再失败降级返回原文"]
+    out["输出 · SSE / JSON<br/>帧序 meta → citations → delta → done<br/>done 带 latency_ms / ttft_ms / cost_cny"]
+    abst["abstained=true 卡片<br/>不调 LLM · 该路径 1 s 内返回"]
+  end
+
+  subgraph IDX["离线索引旁路（M1–M3）"]
+    direction TB
+    fetch["M1 采集<br/>scripts/fetch_corpus.py<br/>抓 4 个源官网"]
+    corpus["content/ 语料<br/>255 篇 · 214.8 万字 · 磁盘约 3.4 MB"]
+    chunk["M2 切分 · chunker<br/>按 H2/H3 → 2099 块<br/>单块 800 token 以内 · 留 100 重叠"]
+    emb["M3 embedder<br/>batch 16 · embed_cache 47 MB"]
+    store["M3 索引落地<br/>LanceDB 向量 / bm25.pkl / SQLite<br/>doc_hash 增量 · 软删标记"]
+    fetch --> corpus --> chunk --> emb --> store
+  end
+
+  client --> api --> qu
+  qu --> vec
+  qu --> bm25
+  vec --> rrf
+  bm25 --> rrf
+  rrf --> rerank --> gate
+  gate -- 通过 --> gen
+  gate -- 拒答 --> abst
+  gen --> cite
+  cite -- 校验失败 · 重生成 1 次 --> gen
+  cite --> out
+  store -. 离线灌库 .-> vec
+  store -. 离线灌库 .-> bm25
+
+  classDef main fill:#FFFFFF,stroke:#1F3A5F,stroke-width:2px,color:#1F3A5F;
+  classDef gate fill:#FFFFFF,stroke:#B45309,stroke-width:2px,color:#B45309;
+  classDef out fill:#FFFFFF,stroke:#15803D,stroke-width:2px,color:#15803D;
+  classDef idx fill:#FFFFFF,stroke:#6B7280,stroke-width:1.5px,color:#6B7280,stroke-dasharray:6 4;
+  class client,api,qu,vec,bm25,rrf,rerank,gen,cite main;
+  class gate,abst gate;
+  class out out;
+  class fetch,corpus,chunk,emb,store idx;

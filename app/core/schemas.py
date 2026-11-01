@@ -148,3 +148,93 @@ class ScoredChunk(BaseModel):
     def cite(self) -> str:
         """引用标签：生成侧按 [chunk_id] 标注，校验侧拿它对照上下文。"""
         return "[" + self.chunk_id + "]"
+
+
+# ---------------------------------------------------------------------------
+# 生成侧（M7）与校验侧（M8）的共享契约。先冻结字段，两边并行开发，谁都不许改这里。
+# 字段与设计清单 §7 的 DiagnosisCard 响应体一一对应。
+# ---------------------------------------------------------------------------
+
+
+class Evidence(BaseModel):
+    """一条结论的证据：chunk_id 必须能在本次上下文里找到，否则校验侧判无效。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    chunk_id: str
+    url: str = ""
+    score: float | None = None
+
+
+class Cause(BaseModel):
+    """一条根因假设。confidence 是模型自评，校验侧只做区间夹取，不重算。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    title: str
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    explanation: str = ""
+    evidence: list[Evidence] = Field(default_factory=list)
+
+
+class Citation(BaseModel):
+    """给前端做的引用面板：点开能跳原文。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    chunk_id: str
+    title: str = ""
+    heading_path: str = ""
+    url: str = ""
+
+
+class DiagnosisCard(BaseModel):
+    """结构化诊断卡（§7 响应体）。abstained=true 时 causes 必须为空。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    diagnosis_id: str = ""
+    abstained: bool = False
+    summary: str = ""
+    causes: list[Cause] = Field(default_factory=list)
+    verify_commands: list[str] = Field(default_factory=list)
+    actions: list[str] = Field(default_factory=list)
+    citations: list[Citation] = Field(default_factory=list)
+
+    latency_ms: int = 0
+    ttft_ms: int | None = None
+    cost_cny: float = 0.0
+    degraded: bool = False
+
+    model: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    abort_reason: str | None = None
+
+    def cited_ids(self) -> set[str]:
+        """卡里出现过的所有 chunk_id（causes.evidence + citations）。"""
+        ids: set[str] = set()
+        for cause in self.causes:
+            for ev in cause.evidence:
+                if ev.chunk_id:
+                    ids.add(ev.chunk_id)
+        for cit in self.citations:
+            if cit.chunk_id:
+                ids.add(cit.chunk_id)
+        return ids
+
+
+class CitationReport(BaseModel):
+    """M8 校验结果。ok=False 时按设计清单走「重生成一次再降级」。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    total: int = 0
+    valid: int = 0
+    invalid_ids: list[str] = Field(default_factory=list)
+    orphan_causes: list[int] = Field(default_factory=list)
+    coverage: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        return not self.invalid_ids and not self.orphan_causes

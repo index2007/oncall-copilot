@@ -64,6 +64,21 @@ class Settings(BaseSettings):
     abstain_threshold: float = 0.35
     sub_index_filter: bool = True  # Query 理解命中子库时是否加元数据过滤
 
+    # -- 生成（M7）---------------------------------------------
+    llm_temperature: float = 0.2
+    llm_max_tokens: int = 800
+    llm_timeout_s: float = 60.0
+    llm_max_retry: int = 1  # 设计清单 M7：JSON 解析失败重试 1 次
+    # 价格以官网为准（api-docs.deepseek.com/quick_start/pricing）；
+    # 两项都为 0 时 cost_cny 恒为 0，只记 token 数
+    llm_price_in_cny_per_mtok: float = 2.0
+    llm_price_out_cny_per_mtok: float = 8.0
+
+    # -- 重排（M6）---------------------------------------------
+    rerank_timeout_s: float = 30.0
+    rerank_max_docs: int = 20  # 单次 rerank 请求最多带多少条候选
+    rerank_price_cny_per_mtok: float = 0.0  # 硅基流动当前免费，非 0 才计入成本
+
     # -- 路径 --------------------------------------------------
     data_dir: str = "./data"
     content_dir: str = "./content"
