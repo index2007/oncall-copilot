@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-flash"  # 该账号实际模型；deepseek-chat 只是别名
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
+    # Query 理解的 LLM 兜底（只在规则没命中且 query 够长时触发）
+    query_llm_enabled: bool = True
+    query_llm_timeout_s: float = 15.0
 
     # -- embedding / rerank（HTTP，本机不装模型）---------------
     sf_api_key: str = ""
@@ -55,9 +58,11 @@ class Settings(BaseSettings):
     # -- 检索参数 ----------------------------------------------
     top_k_vec: int = 20
     top_k_bm25: int = 20
+    top_k_fuse: int = 20  # 融合后交给重排的条数（M5 -> M6）
     top_k_final: int = 5
     rrf_k: int = 60
     abstain_threshold: float = 0.35
+    sub_index_filter: bool = True  # Query 理解命中子库时是否加元数据过滤
 
     # -- 路径 --------------------------------------------------
     data_dir: str = "./data"

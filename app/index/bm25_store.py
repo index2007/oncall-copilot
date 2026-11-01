@@ -97,22 +97,32 @@ class BM25Store:
         return len(rows)
 
     # -- 检索 --------------------------------------------------
-    def search(self, query: str, k: int = 20) -> list[dict]:
+    def search(self, query: str, k: int = 20, source: str | None = None) -> list[dict]:
+        """BM25 检索。source 不为空时只返回该子库（k8s/redis/nginx/mysql）的块。
+
+        过滤放在候选遍历里而不是先截断再过滤：否则子库里排第 21 名、
+        全局排第 3 名的块会被自己的截断吃掉。
+        """
         if self._bm25 is None or not self.rows:
             return []
         q_tokens = tokenize(query)
         if not q_tokens:
             return []
         scores = self._bm25.get_scores(q_tokens)
-        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
         out: list[dict] = []
-        for i in ranked:
+        for i in order:
             score = float(scores[i])
             if score <= 0:
+                break  # 已按分数降序，后面的都 <= 0
+            row = self.rows[i]
+            if source is not None and row.get("source") != source:
                 continue
-            row = dict(self.rows[i])
-            row["score"] = score
-            out.append(row)
+            item = dict(row)
+            item["score"] = score
+            out.append(item)
+            if len(out) >= k:
+                break
         return out
 
     # -- 持久化 ------------------------------------------------

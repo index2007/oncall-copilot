@@ -1,0 +1,50 @@
+{"text":"Pod 状态 CrashLoopBackOff，日志里什么都没有","resource_type":"pod"}
+{"text":"我的 Pod 一直 Pending，事件里 FailedScheduling","resource_type":"pod"}
+{"text":"worker 节点变成 NodeNotReady，上面跑的容器全挂了","resource_type":"node"}
+{"text":"Deployment 滚动更新卡住，新版本一直不起","resource_type":"deployment"}
+{"text":"DaemonSet 没有在每个节点上被创建","resource_type":"daemonset"}
+{"text":"StatefulSet 的有序启动卡在第 2 个副本","resource_type":"statefulset"}
+{"text":"Job 跑了一晚上一直没完成","resource_type":"job"}
+{"text":"CronJob 没有按时间触发","resource_type":"cronjob"}
+{"text":"Service 的 ClusterIP 集群内访问不通","resource_type":"service"}
+{"text":"Ingress 规则没生效，网关直接返回 404","resource_type":"ingress"}
+{"text":"ConfigMap 更新之后热加载没生效","resource_type":"configmap"}
+{"text":"Secret 读不出来，权限被拒","resource_type":"secret"}
+{"text":"PVC 一直绑定失败，状态卡在 Pending","resource_type":"pvc"}
+{"text":"PV 的回收策略被改成 Delete，数据没了","resource_type":"pv"}
+{"text":"StorageClass 动态供给失败","resource_type":"storageclass"}
+{"text":"Namespace 删不掉，一直卡在 Terminating","resource_type":"namespace"}
+{"text":"kubelet 报 PLEG is not healthy","resource_type":"kubelet"}
+{"text":"kube-apiserver 频繁返回 502","resource_type":"apiserver"}
+{"text":"controller-manager 选主失败，一直重启","resource_type":"controller-manager"}
+{"text":"scheduler 的调度分布很不均衡","resource_type":"scheduler"}
+{"text":"etcd 集群的 leader 频繁切换","resource_type":"etcd"}
+{"text":"CoreDNS 解析外部域名超时","resource_type":"coredns"}
+{"text":"Redis 内存达到 maxmemory 之后写入失败","resource_type":"redis"}
+{"text":"Redis 主从复制延迟越来越大","resource_type":"redis"}
+{"text":"哨兵切换之后客户端连的地址没更新","resource_type":"redis"}
+{"text":"Redis 报 CLUSTERDOWN，集群不可用","resource_type":"redis"}
+{"text":"MISCONF Redis is configured to save RDB snapshots 报错","resource_type":"redis"}
+{"text":"Redis 连接数被打满，新连接直接被拒","resource_type":"redis"}
+{"text":"MySQL 主从延迟突然变大","resource_type":"mysql"}
+{"text":"InnoDB 死锁，事务被回滚","resource_type":"mysql"}
+{"text":"MySQL 报 too many connections","resource_type":"mysql"}
+{"text":"表锁等待超时，事务卡住不动","resource_type":null}
+{"text":"ERROR 1213 Deadlock found when trying to get lock","resource_type":null}
+{"text":"MySQL 表空间满了，写不进去","resource_type":"mysql"}
+{"text":"MySQL 慢查询日志里全是全表扫描","resource_type":"mysql"}
+{"text":"nginx 返回 502 Bad Gateway","resource_type":"nginx"}
+{"text":"nginx upstream timed out 返回 504","resource_type":"nginx"}
+{"text":"Nginx 报 worker_connections are not enough","resource_type":"nginx"}
+{"text":"nginx.conf 改了之后 reload 不生效","resource_type":"nginx"}
+{"text":"403 Forbidden，目录索引被关掉了","resource_type":null}
+{"text":"502 错误，upstream 连接被拒绝","resource_type":"nginx"}
+{"text":"keepalive 连接数不够用了","resource_type":null}
+{"text":"服务突然变慢，页面加载很久","resource_type":null}
+{"text":"日志里有奇怪的告警，不知道什么意思","resource_type":null}
+{"text":"昨晚开始业务量下降，帮忙看看","resource_type":null}
+{"text":"线上出问题了，帮我分析一下可能原因","resource_type":null}
+{"text":"接口偶尔返回空数据，概率大概百分之一左右","resource_type":null}
+{"text":"这台机器负载很高，负载值一直在 30 以上","resource_type":null}
+{"text":"数据库连接池好像不够用了，请求排队","resource_type":null}
+{"text":"缓存里的数据更新不及时，用户看到旧值","resource_type":null}

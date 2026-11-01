@@ -1,0 +1,12 @@
+{"query":"Pod 被 OOMKilled，退出码 137，容器反复重启","marker":"OOMKilled","sources":["k8s"],"note":"内存超限被 cgroup 杀"}
+{"query":"Pod 一直 Pending，事件里是 FailedScheduling 调度失败","marker":"FailedScheduling","sources":["k8s"],"note":"调度器无可用节点"}
+{"query":"Pod 状态 CrashLoopBackOff，日志看不出来原因","marker":"CrashLoopBackOff","sources":["k8s"],"note":"容器反复退出重启"}
+{"query":"镜像拉取失败 ImagePullBackOff","marker":"ImagePullBackOff","sources":["k8s"],"note":"镜像仓库认证/网络"}
+{"query":"节点内存不足，Pod 被驱逐到别的节点","marker":"内存不足","sources":["k8s"],"note":"节点内存压力驱逐"}
+{"query":"存活探针失败，容器不停重启","marker":"存活探针","sources":["k8s"],"note":"livenessProbe 配置"}
+{"query":"节点有污点，Pod 无法调度上去","marker":"污点","sources":["k8s"],"note":"taint/toleration"}
+{"query":"集群内 DNS 解析失败，Service 域名访问不到","marker":"DNS 解析","sources":["k8s"],"note":"CoreDNS 解析"}
+{"query":"InnoDB 死锁 Deadlock found，事务被回滚","marker":"Deadlock","sources":["mysql"],"note":"间隙锁死锁"}
+{"query":"Redis 达到 maxmemory 上限后写入失败","marker":"maxmemory","sources":["redis"],"note":"内存淘汰策略"}
+{"query":"Redis 连接被拒绝 connection refused","marker":"connection refused","sources":["redis"],"note":"maxclients/网络"}
+{"query":"nginx worker_connections 不够，连接被拒","marker":"worker_connections","sources":["nginx"],"note":"worker 连接上限"}

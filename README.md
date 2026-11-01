@@ -126,6 +126,26 @@ chunk 数落在 2099 而不是清单的 2500-3500：k8s 是 H2/H3 密集型文�
 
 ---
 
+### 5.2 检索层实测（M4 Query 理解 + M5 双路召回）
+
+`python scripts/eval_retrieval_probe.py` 一把跑完；样本在 `eval/probe_query_understanding.jsonl`（50 条报错文本）与 `eval/probe_recall.jsonl`（12 条）。
+
+| 指标 | 门槛 | 实测 | 说明 |
+|---|---|---|---|
+| resource_type 准确率（纯规则） | ≥0.90 | **1.000**（50/50） | 不调 LLM |
+| resource_type 准确率（允许调 LLM） | ≥0.90 | **0.980**（49/50） | 全程只有 1 条触发 LLM |
+| need_llm 占比 | <20% | **2.0%**（1/50） | 规则无信号且 query > 20 字才置位 |
+| recall@20（子库过滤，默认路径） | ≥0.95 | **1.000**（12/12） | 平均覆盖 0.901，Top1 命中 0.833 |
+| recall@20（不过滤，fallback 路径） | ≥0.95 | **0.917**（11/12） | 唯一漏的是 `Redis connection refused` |
+
+- 检索热路径 P50 14 ms / P95 17 ms（embedding 命中缓存后，只剩 LanceDB 检索 + BM25 + RRF）；冷启动第一次查询 0.8 s（建连、开 LanceDB、首次 embedding），单列不混进 P50。
+- 查询文本 = 原始 query + 错误码 + 强事件词（`OOMKilled` / `FailedScheduling` 这类），弱事件词（`error` / `pending`）不拼，避免把噪声塞进向量查询。
+- **这张表是乐观估计，别按 1.000 讲**：50 条报错文本是我照语料自拟的，不是线上工单；`extract_resource` 的"取最先出现的资源词"规则，是在看到 2 条错判后改的（`worker 节点变成 NodeNotReady，上面跑的容器全挂了` 曾被判成 container、`DaemonSet 没有在每个节点上被创建` 曾被判成 node）。没留独立测试集，真实分布下按 0.90-0.95 预期。
+- 开 LLM 后那条判错的样本是 `这台机器负载很高，负载值一直在 30 以上`：模型给出 `node`，标注里算"无资源"，属标注口径差异，不是模型答错。
+- 子库过滤不是锦上添花：`Redis 连接被拒绝 connection refused` 在不过滤时 Top-20 里一条 redis 文档都没有，过滤后才命中。命中不了时 `retrieve()` 会补跑不限源两路（`stats.fallback=true`），所以过滤只影响排序起点，不影响召回底线。
+
+---
+
 ## 6. 快速开始
 
 ```bash
@@ -205,7 +225,8 @@ cp .env.example .env            # 仅作模板参考，真实值读 ONCALL_ENV_F
 6. **没有鉴权**：接口对本地开放，网络暴露前必须加 token。
 7. **LLM 生成失败降级**：JSON 解析失败重试 1 次，再失败降级为纯文本片段（`degraded=true`），此时没有结构化字段。
 8. **`embed_cache.jsonl` 是明文 JSONL**（47 MB / 2081 条，浮点全精度）：换 float32 二进制能压到 1/4，但重跑索引省下的 API 调用远比磁盘值钱，暂不做。
-9. **Redis 语料有版本变体近似重复**（`operate-rs-7.22-*` / `7.8-*` / `7.4-*` 同一篇按版本重复收录）：`doc_hash` 精确去重识别不了，会抬升同质块竞争，D7 前按 URL 去版本段或模糊去重。
+9. **nginx 语料只有官方模块参考页**：没有 502/504 排障专页，nginx 类问题 Top-1 常落在 `ngx_http_upstream_module` 的参数说明上——召回对、根因浅，D7 评测时要单独看 nginx 子集。
+10. **Redis 语料有版本变体近似重复**（`operate-rs-7.22-*` / `7.8-*` / `7.4-*` 同一篇按版本重复收录）：`doc_hash` 精确去重识别不了，会抬升同质块竞争，D7 前按 URL 去版本段或模糊去重。
 
 ---
 
@@ -220,8 +241,8 @@ oncall-copilot/
 │   └── obs/          # db / logging
 ├── content/          # 255 篇抓取的 Markdown（gitignore）
 ├── data/             # lancedb / bm25.pkl / oncall.db / embed_cache.jsonl（gitignore）
-├── eval/             # dataset.jsonl / run_eval.py / report.md
-├── scripts/          # fetch_corpus.py / smoke_api.py / simulate_alert.py / demo.py
+├── eval/             # dataset.jsonl / run_eval.py / report.md + 探针样本 probe_*.jsonl
+├── scripts/          # fetch_corpus.py / smoke_api.py / eval_retrieval_probe.py / simulate_alert.py / demo.py
 ├── tests/
 ├── .env.example
 ├── requirements.txt
@@ -236,7 +257,7 @@ oncall-copilot/
 |---|---|---|
 | D1 | 环境 + 抓取脚本 + 语料 | ✅ 完成（255 篇 / 214.8 万字） |
 | D2 | 切分 + 索引（LanceDB / BM25） | ✅ 完成（2099 块；全量 98 s、二次运行 0 API / 0.2 s） |
-| D3 | Query 理解 + 双路召回 + RRF | 未开工 |
+| D3 | Query 理解 + 双路召回 + RRF | ✅ 完成（50 条探针：规则 1.000 / need_llm 2%；recall@20 1.000；35 个单测） |
 | D4 | 重排 + 生成 + 引用校验 / 拒答 | 未开工 |
 | D5 | API 全量（SSE / webhook / admin）+ 日志 | 未开工 |
 | D6 | 评测集 + 评测脚本 | 未开工 |
