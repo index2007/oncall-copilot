@@ -64,7 +64,7 @@
 ## 3. 与口述版本不一致的 6 处（我按文件和代码改的）
 
 1. **冷启动**：口述是「0.8–1.5 s」，文档里只有「首次查询 0.8 s（含模型加载）」（README §5.2），**图上写 0.8 s**，没有 1.5 这个数。
-2. **整卡耗时**：口述是「3.5–4 s」；D4 两批 18 次真实调用 P50 ≈4040 ms、最慢 7089 ms，v1.5 口径是「P50 ≤4.5 s、P95 ≤8.0 s」（设计清单 §6.5、README §5.3）。**图上写实测值 + 新门槛，口述时说「P50 稳在 4 s 上下，P95 随模型输出长度漂移，不承诺」，不要说「已经稳定达标」。**
+2. **整卡耗时**：口述是「3.5–4 s」；D4 四批 36 次真实调用 P50 约 4.2 s / P95 8003 ms / 最慢 8306 ms，v1.5 口径是「P50 ≤4.5 s、P95 ≤8.0 s」（设计清单 §6.5、README §5.3）。**图上写实测值 + 新门槛，口述时说「P50 稳在 4 s 上下，P95 贴线、36 次里有 2 次破 8 s」，不要说「P95 已达标」。**
 3. **诊断卡字段**：口述是 summary / root_cause / confidence / evidence / next_steps / citations，设计清单 §7 的真实定义是 `diagnosis_id / abstained / causes[{title, confidence, evidence[chunk_id, url, score]}] / verify_commands / actions / citations / latency_ms / cost_cny / degraded`。**图上只写真实存在的 causes / verify_commands / actions**，没有编 summary、root_cause、next_steps。
 4. **资源类型词典**：代码 `RESOURCE_TYPES` 是 26 个键，**图上写 26**；设计清单 M4 原写 20 词，已按实测修成 26 词（v1.4）。
 5. **embedding batch**：设计清单 §3.1 原先写 32–64、§5 M3 与 `config.py:73` 是 16，**图上写 16**；§3.1 已在 v1.4 统一为 16（实测 125 次 `/embeddings` 请求）。
