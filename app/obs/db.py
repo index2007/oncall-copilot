@@ -55,6 +55,27 @@ CREATE TABLE IF NOT EXISTS index_runs (
     elapsed_s      REAL NOT NULL DEFAULT 0,
     note           TEXT
 );
+
+CREATE TABLE IF NOT EXISTS query_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id        TEXT,
+    endpoint          TEXT,
+    query             TEXT,
+    plan_json         TEXT,
+    hit_chunk_ids     TEXT,
+    context_chunk_ids TEXT,
+    answer_len        INTEGER NOT NULL DEFAULT 0,
+    abstained         INTEGER NOT NULL DEFAULT 0,
+    degraded          INTEGER NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT 'ok',
+    ttft_ms           REAL,
+    latency_ms        REAL,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_cny          REAL NOT NULL DEFAULT 0,
+    created_at        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_query_log_created ON query_log(created_at);
 """
 
 
@@ -183,3 +204,113 @@ class DB:
                 "SELECT * FROM index_runs ORDER BY run_id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- query_log（M11 可观测） --------------------------------
+    def log_query(
+        self,
+        *,
+        request_id: str,
+        endpoint: str,
+        query: str,
+        plan_json: str = "",
+        hit_chunk_ids: str = "",
+        context_chunk_ids: str = "",
+        answer_len: int = 0,
+        abstained: bool = False,
+        degraded: bool = False,
+        status: str = "ok",
+        ttft_ms: float | None = None,
+        latency_ms: float | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost_cny: float = 0.0,
+    ) -> int:
+        """落一行请求日志。
+
+        为什么失败也要落（status != ok）：metrics 里的 error_rate 要有分母，
+        排查偶发 500 时最需要的就是那条失败记录。
+        写日志本身绝不能把请求带崩——调用方负责 try/except。
+        """
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT INTO query_log (request_id, endpoint, query, plan_json, hit_chunk_ids,
+                    context_chunk_ids, answer_len, abstained, degraded, status, ttft_ms,
+                    latency_ms, prompt_tokens, completion_tokens, cost_cny, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    endpoint,
+                    (query or "")[:2000],
+                    plan_json or "",
+                    hit_chunk_ids or "",
+                    context_chunk_ids or "",
+                    int(answer_len or 0),
+                    1 if abstained else 0,
+                    1 if degraded else 0,
+                    status,
+                    ttft_ms,
+                    latency_ms,
+                    int(prompt_tokens or 0),
+                    int(completion_tokens or 0),
+                    float(cost_cny or 0.0),
+                    utc_now(),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def query_log_rows(self, limit: int = 200) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM query_log ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def metrics_summary(self, window: int = 200) -> dict:
+        """近 window 次请求的汇总；百分位用最近秩（nearest-rank），不插值。
+
+        为什么不用插值：样本量只有几十条时，插值会给出一个没出现过的耗时，
+        被追问「这个 P95 是哪条请求」就答不上来；最近秩永远对应一条真实请求。
+        """
+        rows = self.query_log_rows(limit=window)
+        total = len(rows)
+        lat = [float(r["latency_ms"]) for r in rows if r.get("latency_ms") is not None]
+        ttft = [float(r["ttft_ms"]) for r in rows if r.get("ttft_ms") is not None]
+        costs = [float(r.get("cost_cny") or 0.0) for r in rows]
+        comps = [int(r.get("completion_tokens") or 0) for r in rows]
+        endpoints: dict[str, int] = {}
+        for r in rows:
+            key = str(r.get("endpoint") or "?")
+            endpoints[key] = endpoints.get(key, 0) + 1
+        abstained = sum(1 for r in rows if r.get("abstained"))
+        degraded = sum(1 for r in rows if r.get("degraded"))
+        errors = sum(1 for r in rows if str(r.get("status") or "ok") != "ok")
+        return {
+            "window": int(window),
+            "requests": total,
+            "ttft_p50_ms": _percentile(ttft, 50),
+            "ttft_p95_ms": _percentile(ttft, 95),
+            "latency_p50_ms": _percentile(lat, 50),
+            "latency_p95_ms": _percentile(lat, 95),
+            "abstain_rate": round(abstained / total, 4) if total else 0.0,
+            "degraded_rate": round(degraded / total, 4) if total else 0.0,
+            "error_rate": round(errors / total, 4) if total else 0.0,
+            "avg_cost_cny": round(sum(costs) / total, 6) if total else 0.0,
+            "total_cost_cny": round(sum(costs), 6),
+            "avg_completion_tokens": round(sum(comps) / total, 1) if total else 0.0,
+            "by_endpoint": endpoints,
+        }
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    """最近秩百分位：样本为空返回 None，否则返回真实存在的某个值。"""
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return round(ordered[0], 1)
+    import math
+
+    idx = max(0, min(len(ordered) - 1, math.ceil(q / 100.0 * len(ordered)) - 1))
+    return round(ordered[idx], 1)

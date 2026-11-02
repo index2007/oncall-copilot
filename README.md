@@ -2,7 +2,7 @@
 
 > 把「线上出事了」这句求助，变成一张可机读、带引用的结构化诊断卡。
 
-**状态**：开发中（D1 完成 / D2 起未开工）。本 README 的指标表在 D7 实测前一律留空，不填预计值。
+**状态**：D5 完成（M0-M5 + 全部 7 个接口 + SSE + 日志），D6-D10 未开工。指标数字一律来自可重跑的脚本；未实测的写「待 D7」，不填预计值。
 
 ```
 报错文本 / Alertmanager 告警
@@ -77,22 +77,31 @@
 
 ## 4. 性能：实测数据与验收口径
 
-**先说结论**：带 LLM 生成的架构下，"P95 ≤2.0s"和"整卡 ≤4s"都不可达（本机不许跑模型，且输出长度由模型自己决定），因此把延迟拆成两段验收：首 token 是主口径，整卡按 P50/P95 报，并如实写在这里。
+**先说结论**：延迟的大头不是检索，是模型写多长、以及它有没有在"想"。`deepseek-flash` 默认带思考（`effort=high`，`/v1/models` 里可查），思考 token 既慢又不可控；把它关掉（`LLM_THINKING=disabled`）后，同一套链路整卡从 P50 约 4.2 s 降到 2.3 s。下表是**关闭思考之后**的 9 次流式实测（`scripts/bench_stream.py`，真实 API）。
 
 | 链路 | 实测 | 条件 |
 |---|---|---|
 | `bge-m3` embedding（2 条） | 303 ms | 硅基流动 `/v1/embeddings`，dim=1024，L2=1.000 |
 | `bge-reranker-v2-m3`（3 条候选） | 200 ms | 相关 0.5587 / 无关 0.0000 |
-| `deepseek-flash` 生成 400 tokens | 2702 / 3255 / 3286 ms | 约 130 token/s，连跑三次 |
+| `bge-reranker-v2-m3`（20 条候选，真链路） | 330-534 ms | 9 次均值 422 ms，固定开销约 300 ms |
+| `deepseek-flash` 首 content token | 约 400-600 ms | 关思考；开思考时 6 s+（先吐一堆 `reasoning_content`） |
+| `deepseek-flash` 正文输出 | 约 130 token/s | 296-329 tokens 的卡片 ≈ 1.2-1.7 s |
 
 | 验收项 | 门槛 | 现状 |
 |---|---|---|
-| SSE 首 token | ≤1.2 s | 未实现（D5） |
-| 整卡（含检索 + 重排 + 生成） | P50 ≤4.5 s、P95 ≤8.0 s | 36 次实测（四批 `--repeat 3`）：**P50 约 4.2 s，P95 8003 ms，最慢 8306 ms，2/36 次贴线越 8 s**；P50 稳定达标、P95 贴线未过，见 §5.3 |
-| 分阶段 P50 / P95 | 只采集，不设门槛 | `/v1/metrics/summary` 按段输出（Query 理解 / 检索 / 重排 / 生成） |
-| 单次成本 | ≤¥0.02 | 实测 ¥0.0046-0.0129/次（9 次均值 ¥0.0074） |
+| SSE 首 token | ≤1.2 s | 9 次流式实测：**P50 1177 ms、P95 1349 ms、最慢 1349 ms**；8 次有正文的里 3 次略超（1207 / 1210 / 1349 ms） |
+| 整卡（含检索 + 重排 + 生成） | P50 ≤4.5 s、P95 ≤8.0 s | 9 次：**P50 2324 ms、P95 2817 ms、最慢 2817 ms，0/9 越 4 s**；按 v1.5 口径（P50 ≤4.5 / P95 ≤8.0）是已过 |
+| 分阶段 P50 / P95 | 只采集，不设门槛 | `/v1/metrics/summary`；9 次均值：Query 理解 0.3 / 检索 95 / 重排 422 / 生成 1670 ms |
+| 单次成本 | `¥0.02` | `¥0.0035-0.0059`/次，均值 `¥0.0043`（9 次合计 `¥0.0385`） |
 
-**首字怎么做到 1.2 s**：SSE 帧序固定为 `meta`（Query 理解）→ `citations`（已确定的 chunk）→ `delta`（正文增量）→ `done`（`latency_ms`/`ttft_ms`/`cost_cny`）。首字不必等 LLM——检索与重排结束即可开流；拒答路径更早，<1 s 返回完整卡片。
+**思考 token 是此前"整卡 4 s 不可达"的真因**（v1.5 放宽口径的依据，现在有了更好的解法，门槛不动只补数据）：
+
+- 关掉前：SSE 首 token 6137-6141 ms、整卡 6390 ms（同一条查询）；D4 四批 36 次 P50 约 4.2 s、P95 8003 ms（明细见 §5.3，那批就是默认开思考跑的）。
+- 关掉后：首 token 1177 ms、整卡 2324 ms（上表）。
+- 三种关法实测（20 token 小请求，量第一个 `delta.content`）：`thinking={"type":"disabled"}` 523 ms < `reasoning_effort="none"` 586 ms < 不关 855 ms —— 选第一种，写进 `_apply_thinking()`。
+- 副作用：关思考会牺牲一点推理深度（多跳归因、跨文档串联）。D7 要用评测集量一次"开/关思考"的 Top-1 差值，再决定是否只在复杂 query 上开（`LLM_THINKING=auto`）。
+
+**首字怎么做到 1.2 s**：SSE 帧序固定为 `meta`（Query 理解）→ `citations`（已确定的 chunk）→ `delta`（正文增量）→ `done`（`latency_ms`/`ttft_ms`/`cost_cny`）。首字不必等 LLM——检索与重排结束即可开流；拒答路径更早，<1 s 返回完整卡片（实测 690 ms，0 元）。1.2 s 里真正花掉的：重排 330-534 ms + LLM 首字 400-600 ms + 检索 95-230 ms。
 
 ---
 
@@ -146,7 +155,9 @@ chunk 数 2099，落在设计清单 v1.4 的目标区间 1800-2200 内（v1.3 �
 
 ---
 
-### 5.3 生成层与端到端实测（M6/M7/M8 + D4）
+### 5.3 生成层与端到端实测（M6/M7/M8 + D4，thinking 默认开启时的旧测）
+
+> 这一节的数字是 `deepseek-flash` **默认开思考**（`effort=high`）跑出来的，保留作对照：它解释了 v1.5 当初为什么把整卡门槛放宽到 P50 ≤4.5 / P95 ≤8.0。关掉思考后的数据在 §5.4，整卡直接落到 2.3 s。
 
 `python scripts/d4_e2e.py --repeat 3` 一把跑完（3 条样例 × 3 次，真实 API，不是 mock）。样例是 k8s `OOMKilled/exit 137`、nginx `502 upstream prematurely closed`、MySQL `1213 deadlock`。
 
@@ -185,6 +196,29 @@ chunk 数 2099，落在设计清单 v1.4 的目标区间 1800-2200 内（v1.3 �
 
 ---
 
+### 5.4 流式端到端实测（D5，关闭思考）
+
+`python scripts/bench_stream.py --out data/bench_stream.json` 一把跑完（9 条查询 × 1 次，真实 API + 真实 SSE 链路，样本覆盖 k8s / nginx / MySQL / Redis 四个源，含 2 条语料里没有的题）。机器可读结果在 `data/bench_stream.json`。
+
+| # | 查询（缩写） | TTFT | 整卡 | 其中检索 / 重排 / 生成 | 拒答 | causes | 输出 tok | 成本 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Pod CrashLoopBackOff，exit 137 | 953 ms | 2324 ms | 16 / 534 / 1766 | 否 | 2 | 296 | ¥0.0058 |
+| 2 | 容器 OOMKilled，节点还有 30% | 989 ms | 2817 ms | 232 / 347 / 2232 | 否 | 2 | 329 | ¥0.0059 |
+| 3 | nginx upstream prematurely closed | 1210 ms | 2068 ms | 18 / 523 / 1520 | 是 | 0 | 166 | ¥0.0040 |
+| 4 | nginx 502 Bad Gateway（uwsgi） | 1349 ms | 2195 ms | 140 / 446 / 1601 | 是 | 0 | 158 | ¥0.0038 |
+| 5 | MySQL 1213 deadlock | 1177 ms | 2745 ms | 14 / 390 / 2334 | 否 | 2 | 320 | ¥0.0049 |
+| 6 | MySQL Too many connections | —（未进 LLM） | 690 ms | 139 / 544 / 0 | 是 | 0 | 0 | ¥0 |
+| 7 | redis MISCONF 快照写不进去 | 827 ms | 1638 ms | 16 / 330 / 1284 | 是 | 0 | 154 | ¥0.0035 |
+| 8 | Redis OOM command not allowed | 1173 ms | 2656 ms | 135 / 338 / 2176 | 否 | 2 | 319 | ¥0.0048 |
+| 9 | kubectl 0/3 nodes Insufficient cpu | 1207 ms | 2613 ms | 140 / 344 / 2121 | 否 | 2 | 316 | ¥0.0058 |
+
+**9 次汇总：TTFT P50 1177 ms / P95 1349 ms（8 次有正文的里 3 次略超 1.2 s）；整卡 P50 2324 ms / P95 2817 ms / 最慢 2817 ms，0/9 越 4 s；拒答 4/9；平均 ¥0.0043/次，合计 ¥0.0385。**
+
+- 第 6 条是**闸门前置拒答**：重排 Top1 低于阈值，直接返回 `abstained=true` 的完整卡片，不调 LLM，690 ms / 0 元。这是最理想的一条失败路径。
+- 第 3、4、7 条是**生成侧拒答**：检索到了相关块（重排 0.3-0.9），但模型判断不足以定根因，自己给 `abstained=true`。第 3、4 条正对上 §9 第 9 条（nginx 语料缺 502 排障专页）。
+- 首字三次越线的都是"重排 445-534 ms + 首字 400-600 ms"叠加：重排慢的那几次（>440 ms）就压不住 1.2 s。想再往下压只有两条路——把重排候选从 20 降到 12（省约 100 ms，但牺牲排序质量），或改用便宜的小模型做首段生成（架构复杂度上升）。当前选择如实报 3/8，不藏。
+- 检索 14-18 ms 的条目是 **embedding 命中缓存**（`data/embed_cache.jsonl` 按 `sha256(model+text)` 缓存）；135-232 ms 的是首次查该 query，多一次 `/embeddings` 往返（约 250 ms）。
+
 ## 6. 快速开始
 
 ```bash
@@ -216,17 +250,170 @@ cp .env.example .env            # 仅作模板参考，真实值读 ONCALL_ENV_F
 
 ## 7. 接口
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| POST | `/v1/ask` | 通用问答，`stream=true` 走 SSE |
-| POST | `/v1/diagnose` | 结构化诊断，返回 `DiagnosisCard` |
-| POST | `/webhook/alertmanager` | Alertmanager v4 payload 兼容，内部转 `/v1/diagnose` |
-| GET | `/v1/sources/{chunk_id}` | 原文片段 + url + heading_path |
-| POST | `/v1/admin/index` | 触发增量索引 |
-| GET | `/v1/metrics/summary` | TTFT / 整卡 P50-P95、拒答率、平均成本 |
-| GET | `/v1/health` | 存活 + 索引版本 |
+7 个接口，`/docs` 里全部可直接试。除 webhook 外都吃 JSON、回 JSON；错误统一 `{"detail": "..."}`（422 是 Pydantic 校验失败，字段名在 `loc` 里）。每个请求都带 `X-Request-ID`（中间件生成或透传），并落一行 `query_log`（SQLite `data/oncall.db`）。
 
----
+| 方法 | 路径 | 用途 | 同步/流式 | 单次成本 |
+|---|---|---|---|---|
+| POST | `/v1/ask` | 通用问答；`stream=true` 走 SSE | 两者都支持 | 有 LLM 调用就计费 |
+| POST | `/v1/diagnose` | 结构化诊断（只非流式） | 同步 | 同上 |
+| POST | `/webhook/alertmanager` | Alertmanager v4 告警接入，内部转诊断 | 同步（逐条串行） | 同上 |
+| GET | `/v1/sources/{chunk_id}` | 按 chunk_id 取原文片段 + 出处 | 同步 | 免费 |
+| POST | `/v1/admin/index` | 增量 / 全量重建索引 | 同步（阻塞） | 免费（命中 embedding 缓存） |
+| GET | `/v1/metrics/summary` | 近 N 次的 TTFT / 整卡 / 拒答率 / 成本 | 同步 | 免费 |
+| GET | `/v1/health` | 存活探活 + 五项依赖自检 | 同步 | 免费 |
+
+### 7.1 POST /v1/ask
+
+请求体（与 `/v1/diagnose` 共用）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `query` | string | 是 | 报错文本 / 告警文本，1-4000 字 |
+| `stream` | bool | 否 | 默认 `false`；`true` 返回 `text/event-stream` |
+| `top_n` | int 1-20 | 否 | 最终上下文条数，缺省取 `TOP_K_FINAL=5` |
+| `allow_llm` | bool | 否 | Query 理解是否允许调 LLM；缺省按"规则没命中且 query>20 字"自动决定 |
+
+非流式响应见 7.2（两者同构）。流式时按下面的帧序推送，`event:` 与 `data:` 两行一组：
+
+| 序 | event | data 关键字段 | 何时发 |
+|---|---|---|---|
+| 1 | `meta` | `plan`（`intent` / `resource_type` / `error_codes` / `event_reasons` / `keywords` / `sub_index` / `need_llm`）、`request_id` | Query 理解完成（通常 <5 ms） |
+| 2 | `citations` | `citations[]`（`chunk_id` / `title` / `heading_path` / `url`）、`context[]`（多带 `score` / `rerank_score` / `preview`） | 重排完成、开流之前——客户端先把"依据了哪几段"画出来 |
+| 3 | `delta` ×N | `text`（正文增量，可能是半截 JSON） | 模型每吐一段 |
+| 4 | `done` | `card`（完整诊断卡）、`ttft_ms`、`latency_ms`、`cost_cny`、`timings`、`report`、`regenerated`、`hit_chunk_ids` | 收尾，**以这一帧为准** |
+| — | `error` | `stage`（retrieve/rerank/generate/verify）、`message` | 任一阶段抛错；HTTP 200 已发出，错误只能走事件 |
+
+```
+# 流式：-N 关掉 curl 的缓冲，才能看到逐帧到达
+curl -N -X POST http://127.0.0.1:8000/v1/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"Pod 一直重启，kubectl describe 显示 OOMKilled，exit code 137","stream":true}'
+
+event: meta
+data: {"plan":{"intent":"diagnose","resource_type":"container","error_codes":["137"],...},"request_id":"6f3c1a2b"}
+
+event: citations
+data: {"citations":[{"chunk_id":"c_9484839c6f","title":"Pod 的生命周期","heading_path":"...", "url":"...","score":0.0328,"rerank_score":0.9865,"preview":"..."}],...}
+
+event: delta
+data: {"text":"{\"summary\": \"容器超出内存限制被 cgroup 杀掉"}
+
+event: done
+data: {"card":{"diagnosis_id":"dg_...","abstained":false,"causes":[...],"verify_commands":[...],"actions":[...],"citations":[...],"latency_ms":2317,"ttft_ms":948,"cost_cny":0.005756,"degraded":false},"ttft_ms":948,"latency_ms":2317,"cost_cny":0.005756,"timings":{...},"report":{"total":3,"valid":3,...},"regenerated":false,"hit_chunk_ids":["c_..."]}
+```
+
+三个必须知道的点：
+
+- **`delta` 是过程，`done.card` 是结论**。引用校验不过时会在同一条流里重生成一次（不发明新事件），客户端会看到两段 JSON 拼在一起；解析以 `done` 为准，不要边收边解析。
+- **拒答也是 200 + 正常帧**：`citations` 之后直接 `done`，`card.abstained=true`、`card.abort_reason=low_confidence|no_hits`，整个响应 690 ms 左右、不调 LLM、0 元。
+- 响应头带 `Cache-Control: no-cache` 与 `X-Accel-Buffering: no`（后者给 Nginx 反向代理用，不加会被缓冲成一坨）。
+
+### 7.2 POST /v1/diagnose
+
+请求体同 7.1；**`stream=true` 会被 400 拒绝**，提示改用 `/v1/ask`。响应：
+
+| 字段 | 说明 |
+|---|---|
+| `diagnosis_id` | 本次诊断 id（`dg_YYYYMMDD_xxxx`） |
+| `card` | 诊断卡，字段见下表 |
+| `plan` | Query 理解产物（与 `meta` 帧同构） |
+| `citations` | 上下文里被引用到的 chunk（窄对象） |
+| `report` | 引用校验报告：`total` / `valid` / `invalid_ids` / `orphan_causes` / `coverage` |
+| `abstained_at` | 拒答发生在哪一档：`gate`（重排分数低，未进 LLM）/ `generator` / `null` |
+| `regenerated` | 是否因引用校验失败重生成过一次 |
+| `timings` | 分段耗时：`query_understanding_ms` / `retrieve_ms` / `rerank_ms` / `generate_ms` / `verify_ms` / `total_ms` |
+
+`card` 的字段（Pydantic 模型，不是自由文本）：
+
+| 字段 | 说明 |
+|---|---|
+| `summary` | 一句话结论（≤80 字） |
+| `causes[]` | 根因列表（≤2 条），每条 `title` / `confidence`(0-1) / `explanation` / `evidence[]` |
+| `verify_commands[]` | 只读核验命令（≤3 条，写操作会被白名单过滤掉） |
+| `actions[]` | 处置建议（≤3 条） |
+| `citations[]` | `chunk_id` / `title` / `heading_path` / `url`，**只可能出现在本次上下文里** |
+| `abstained` / `abort_reason` | 是否拒答、拒答原因 |
+| `latency_ms` / `ttft_ms` / `cost_cny` | 整卡耗时（端点自己盖，不信模型）、首字耗时、成本 |
+| `degraded` | 走降级路径（重排失败退回 RRF / JSON 解析失败 / 引用两次都不过） |
+| `model` / `prompt_tokens` / `completion_tokens` | 模型与 token 用量 |
+
+### 7.3 POST /webhook/alertmanager
+
+吃 Alertmanager v4 payload，只读 `alerts[]` 里的 `status` / `labels` / `annotations` / `fingerprint`，其余字段忽略。规则：
+
+- 只处理 `status="firing"`；`resolved` 计入 `skipped`（不诊断）。
+- 一次最多 `MAX_ALERTS=5` 条，超出的也计入 `skipped`；逐条**串行**诊断（并发打 LLM 会更慢）。
+- 告警被拼成自然语言送进诊断链路（`alertname` + `severity` + `summary` + `description` + 关键 labels）。
+- 失败的一条只在 `results[]` 里 `status="error"`，**所以 `accepted + skipped` 可能小于 `alerts` 总数**——这是有意的：部分失败不该让整次调用 500。
+- 成功与失败的每一条都落 `query_log`（`endpoint=/webhook/alertmanager`）。
+
+```
+curl -X POST http://127.0.0.1:8000/webhook/alertmanager \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"4","status":"firing","alerts":[
+       {"status":"firing","labels":{"alertname":"PodCrashLooping","severity":"critical","pod":"order-api-7d9f"},
+         "annotations":{"summary":"Pod 反复重启","description":"exit code 137, OOMKilled"},
+         "fingerprint":"a1b2c3"}]}'
+
+{"accepted":1,"skipped":0,"latency_ms":3430,
+ "results":[{"fingerprint":"a1b2c3","alertname":"PodCrashLooping","status":"firing","severity":"critical",
+             "diagnosis_id":"dg_20261102_ab12","abstained":false,"causes":["容器超出自身内存 limit"],
+             "summary":"容器反复 OOM 重启","latency_ms":3402,"error":""}]}
+```
+
+### 7.4 GET /v1/sources/{chunk_id}
+
+按 `chunk_id` 直查 LanceDB，返回一段原文与可点开的出处；不存在返回 `404 {"detail":"chunk not found"}`。
+
+响应字段：`chunk_id` / `doc_id` / `source`（k8s|nginx|redis|mysql）/ `title` / `heading_path` / `url` / `anchor` / `order` / `token_count` / `text`（**不截断**，最多约 800 tokens）。
+
+```
+curl 'http://127.0.0.1:8000/v1/sources/c_c97fd0c9d2'
+# 200，正文 381 字，32 ms
+```
+
+### 7.5 POST /v1/admin/index
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `full` | bool | `true` 全量重建；`false`（默认）按 `doc_hash` 增量 |
+| `dry_run` | bool | 只算要做什么，不写索引 |
+| `limit` | int | 只处理前 N 篇（调试用） |
+
+响应：`docs_scanned` / `added` / `updated` / `deleted` / `skipped` / `chunks_total` / `chunks_written` / `api_calls` / `cache_hits` / `tokens` / `cost_cny` / `elapsed_s` / `note`。
+
+**同步执行，会阻塞到索引跑完**（全量约 98 s，二次运行 0.2 s）；生产环境应改成后台任务 + 进度查询，`note` 里也固定写了这句。`/docs` 里点 `Try it out` 不要拿 `full=true` 试。
+
+### 7.6 GET /v1/metrics/summary
+
+| 参数 | 范围 | 说明 |
+|---|---|---|
+| `window` | 1-2000 | 统计最近 N 次请求；缺省取 `METRICS_WINDOW=200`，超出会被夹紧 |
+
+响应：`requests` / `ttft_p50_ms` / `ttft_p95_ms` / `latency_p50_ms` / `latency_p95_ms` / `abstain_rate` / `degraded_rate` / `error_rate` / `avg_cost_cny` / `total_cost_cny` / `avg_completion_tokens` / `by_endpoint`（按端点计数）/ `index`（文档与块数）。
+
+百分位用**最近秩法，不插值**：窗口内取排序后第 `⌈p×n⌉` 个值，样本少时不要按正态分布解读。`ttft_p50_ms` 为 `null` 表示窗口内全是拒答请求（没进 LLM，没有首字）。
+
+### 7.7 GET /v1/health
+
+`checks` 五项，全部是**关键项**：`db`（SQLite 可查）/ `vector_store`（LanceDB 有表且有行）/ `bm25`（pickle 可载）/ `content`（`content/` 下有 Markdown）/ `provider_keys`（三个密钥都非空）。
+
+- 五项全过 → `status="ok"`，HTTP 200。
+- 任一不过 → `status="degraded"`，**HTTP 仍是 200**：探活不该因为一个依赖挂了就把 Pod 重启，具体哪项没过看 `checks[name].ok` 与 `.detail`。
+- `index` 里给 `docs` / `chunks` / `lancedb_path`，方便确认"服务起来了，索引也是新的"。
+
+### 7.8 错误码与通用约定
+
+| 状态码 | 场景 | 响应体 |
+|---|---|---|
+| 200 | 成功（含拒答、退化为纯文本片段） | 业务对象 |
+| 400 | `/v1/diagnose` 传了 `stream=true`；参数语义冲突 | `{"detail":"..."}` |
+| 404 | `chunk_id` 不存在 | `{"detail":"chunk not found"}` |
+| 422 | Pydantic 校验失败（`query` 为空或 >4000 字、`top_n` 越界） | `{"detail":[{...}]}` |
+| 500 | 未捕获异常 | `{"detail":"internal error"}` + 完整堆栈进日志 |
+
+- 每个响应都带 `X-Request-ID`，与 `query_log.request_id`、日志里的 `rid=` 对应，排障时按这个 id 串。
+- 所有端点都会被 `query_log` 记录（`/v1/admin/index` 与 `/v1/sources` 只记成功/失败，不记 token 与成本）。
 
 ## 8. 评测
 
@@ -239,7 +426,7 @@ cp .env.example .env            # 仅作模板参考，真实值读 ONCALL_ENV_F
 | 引用命中率 | 引用中至少一条 url ∈ `gold_doc_urls` | ≥0.90 | 待 D7 |
 | 拒答准确率 | 负样本中正确拒答的比例 | ≥0.85 | 待 D7 |
 | 误拒率 | 正样本被错误拒答的比例（必须与拒答率一起看） | 待标定 | 待 D7 |
-| 首字 / 整卡 | 见 §4 | 1.2 s / P50 4.5 s·P95 8.0 s | 整卡已测（§5.3）；首字待 D5 |
+| 首字 / 整卡 | 见 §4 | 1.2 s / P50 4.5 s·P95 8.0 s | 首字 P50 1177 ms / P95 1349 ms；整卡 P50 2324 ms / P95 2817 ms（9 次流式实测，§5.4） |
 | 单次成本 | prompt + completion token 折算 | ≤¥0.02 | 待 D7 |
 
 ### 8.1 基线对比（占位，D7 填满后这张表就是核心资产）
@@ -258,7 +445,7 @@ cp .env.example .env            # 仅作模板参考，真实值读 ONCALL_ENV_F
 
 1. **语料不含 ACK**：阿里云 ACK 文档客户端渲染，抓不到正文；K8s 为主的上限在此。
 2. **默认单机、单进程**：SQLite + LanceDB 嵌入式，不适合多副本并发写；生产化需换 `VectorStore` 实现（pgvector / ES）+ 独立索引 worker。
-3. **整卡压不进 4 s，P95 还贴线越线**：四批 36 次真实调用 P50 约 4.2 s、P95 8003 ms、最慢 8306 ms（§5.3），按 v1.5 口径（P50 ≤4.5 s、P95 ≤8 s）是 P50 达标、**P95 未过**（2/36 越线）。根因是输出 token 数：整卡 ≈ 输出 tokens ÷ 130 + 0.8 s，模型某次把 `verify_commands` 写满（1074 tokens）就必然破 8 s，本机控制不了；检索与重排合计不到 0.8 s，没有多少可压空间。**不承诺 2 s，也不承诺 4 s**；真正的体验保障是 D5 的 SSE 首 token ≤1.2 s。
+3. **首 token 8 次里 3 次略超 1.2 s（P95 1349 ms）**：9 次流式实测 P50 1177 ms、P95 1349 ms、最慢 1349 ms（§5.4）。超的那几次都是「重排 445-534 ms + LLM 首字 400-600 ms」叠加，检索只占 14-232 ms。要压进 1.2 s 只有两条路：重排候选 20→12（约省 100 ms，牺牲排序质量），或首段换更小的模型（架构复杂化）；当前选择如实报。历史：thinking 默认开启时四批 36 次 P50 约 4.2 s、P95 8003 ms（§5.3）；关闭思考后整卡 P50 2324 ms，v1.5 门槛（P50 ≤4.5 s / P95 ≤8.0 s）已过。
 4. **重排阈值需实测标定**：`bge-reranker-v2-m3` 输出区间 0-1，无关内容压到 0.0000、真相关仅 0.5587，`ABSTAIN_THRESHOLD=0.35` 只是初值，D7 按真实语料画 ROC 再定。
 5. **`index.jsonl` 有 7 行历史重复**（k8s 1 / nginx 3 / mysql 3，续抓累积）：114/42/47 行 vs 113/39/44 个 `.md`；索引器只扫 `.md`，不受影响，新的 `--force` 已按 slug 覆盖写，不会再累积。
 6. **没有鉴权**：接口对本地开放，网络暴露前必须加 token。
@@ -281,7 +468,7 @@ oncall-copilot/
 ├── content/          # 255 篇抓取的 Markdown（gitignore）
 ├── data/             # lancedb / bm25.pkl / oncall.db / embed_cache.jsonl（gitignore）
 ├── eval/             # dataset.jsonl / run_eval.py / report.md + 探针样本 probe_*.jsonl
-├── scripts/          # fetch_corpus.py / smoke_api.py / eval_retrieval_probe.py / simulate_alert.py / demo.py
+├── scripts/          # fetch_corpus.py / smoke_api.py / eval_retrieval_probe.py / bench_stream.py / d5_probe.py / audit_corpus.py / simulate_alert.py / demo.py
 ├── tests/
 ├── .env.example
 ├── requirements.txt
@@ -298,7 +485,7 @@ oncall-copilot/
 | D2 | 切分 + 索引（LanceDB / BM25） | ✅ 完成（2099 块；全量 98 s、二次运行 0 API / 0.2 s） |
 | D3 | Query 理解 + 双路召回 + RRF | ✅ 完成（50 条探针：规则 1.000 / need_llm 2%；recall@20 1.000；35 个单测） |
 | D4 | 重排 + 生成 + 引用校验 / 拒答 | ✅ 完成（142 个单测；端到端 36 次真实调用：P50 约 4.2 s、P95 8003 ms、最慢 8306 ms、¥0.0069/次；P50 达标、P95 贴线未过，见 §5.3 与 §9 第 3 条） |
-| D5 | API 全量（SSE / webhook / admin）+ 日志 | 未开工 |
+| D5 | API 全量（SSE / webhook / admin）+ 日志 | ✅ 完成（7 接口 + SSE 帧序 + query_log + metrics；9 次流式实测：首字 P50 1177 ms、整卡 P50 2324 ms、¥0.0043/次；171 个单测） |
 | D6 | 评测集 + 评测脚本 | 未开工 |
 | D7 | 5 变体基线 + 调参（唯一止损点） | 未开工 |
 | D8 | 降级路径测试 + pytest | 未开工 |

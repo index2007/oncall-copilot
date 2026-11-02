@@ -37,6 +37,7 @@ from loguru import logger
 from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.config import Settings, get_settings
+from app.core.http_client import get_client
 from app.core.schemas import ScoredChunk
 
 RERANK_PATH = "/rerank"
@@ -242,8 +243,7 @@ class Reranker:
         if self._client is not None:
             resp = self._client.post(url, json=payload, headers=headers, timeout=self.timeout)
         else:
-            with httpx.Client(timeout=self.timeout) as client:
-                resp = client.post(url, json=payload, headers=headers)
+            resp = get_client().post(url, json=payload, headers=headers, timeout=self.timeout)
         self.request_ms += (time.perf_counter() - started) * 1000
         self.api_calls += 1
 

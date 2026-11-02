@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 800
     llm_timeout_s: float = 60.0
     llm_max_retry: int = 1  # 设计清单 M7：JSON 解析失败重试 1 次
+    # deepseek-flash 是推理模型（/v1/models 标了 effort low/high/max，默认 high）。请求体带
+    # thinking={"type":"disabled"} 才不先"想"一遍；不关的话正文 delta 要到 6 s 后才出现。
+    llm_thinking: str = "disabled"  # disabled / auto
     # 价格以官网为准（api-docs.deepseek.com/quick_start/pricing）；
     # 两项都为 0 时 cost_cny 恒为 0，只记 token 数
     llm_price_in_cny_per_mtok: float = 2.0
@@ -80,6 +83,11 @@ class Settings(BaseSettings):
     rerank_price_cny_per_mtok: float = 0.0  # 硅基流动当前免费，非 0 才计入成本
 
     # -- 路径 --------------------------------------------------
+    # -- API / 可观测 -------------------------------------------------
+    log_level: str = "INFO"
+    log_file: str = ""  # 空 = 只写控制台；填路径则额外落文件
+    metrics_window: int = 200  # /v1/metrics/summary 默认统计最近多少次请求
+
     data_dir: str = "./data"
     content_dir: str = "./content"
     table_name: str = "chunks"

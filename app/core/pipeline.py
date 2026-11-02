@@ -191,6 +191,12 @@ class Diagnoser:
         if report is not None and not report.ok and not card.abstained:
             card = _degraded_card(card, context, report)
 
+        # 生成器内部把"引用全丢"记成 abstained + abort_reason=citations_invalid。那其实是
+        # "有证据但模型在编引用"，不是"没证据所以拒答"：与流式路径（streaming.py 同样置
+        # abstained=False）保持一致，归到 degraded，否则观测侧的拒答率会被幻觉引用污染。
+        if card.abstained and card.abort_reason == "citations_invalid":
+            card = card.model_copy(update={"abstained": False, "degraded": True})
+
         if rerank_degraded:
             card = card.model_copy(update={"degraded": True})
 

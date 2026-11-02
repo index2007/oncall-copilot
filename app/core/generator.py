@@ -21,6 +21,12 @@
   白名单保证"只跑我认识的命令"，黑名单堵住 kubectl get ... && kubectl delete ...
   这种被拼在管道后面的写操作。
 - 网络/HTTP 失败不重试：重试一次 JSON 错误是修格式，重试一次 60s 超时是白烧钱。
+
+流式（D5-A）：
+open_stream() 复用同一套上下文预算与消息拼装，只把调用方式换成 stream=true，
+逐段 yield 正文增量；finalize_stream() 在流结束后复用 _parse_card / _finalize
+（规范化、引用过滤、限长、构造卡），所以流式与非流式的解析口径只有一份。
+generate() 的行为与签名不变，非流式调用方一行都不用改。
 """
 
 from __future__ import annotations
@@ -31,7 +37,9 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence, Union
+
+from app.core.http_client import get_client
 
 import httpx
 from loguru import logger
@@ -87,6 +95,19 @@ class LLMResponse:
 LLMCallable = Callable[..., LLMResponse]
 
 
+def _apply_thinking(payload: dict[str, Any], s: Any) -> None:
+    """关掉推理模型的"先想一遍"。
+
+    deepseek-flash / deepseek-v4-pro 在 /v1/models 里标了 effort(low/high/max)、默认 high，
+    实测不关的话：SSE 先来几十上百个 reasoning_content 块，正文 delta 要等 6 s 才出现
+    （非流式对应 completion_tokens 从 ~300 涨到 ~900，整卡 8 s）。诊断卡是"填模板"类任务，
+    推理带的边际收益不值这 5 s，所以默认 disabled；需要时 LLM_THINKING=auto 打开。
+    """
+
+    if str(getattr(s, "llm_thinking", "disabled")).lower() == "disabled":
+        payload["thinking"] = {"type": "disabled"}
+
+
 def default_llm_callable(settings: Settings | None = None) -> LLMCallable:
     """默认实现：DeepSeek /chat/completions（OpenAI 兼容），带 json_object 模式。"""
 
@@ -102,11 +123,11 @@ def default_llm_callable(settings: Settings | None = None) -> LLMCallable:
             "max_tokens": s.llm_max_tokens,
             "response_format": {"type": "json_object"},
         }
+        _apply_thinking(payload, s)
         headers = {"Authorization": "Bearer " + s.deepseek_api_key, "Content-Type": "application/json"}
-        with httpx.Client(timeout=timeout or s.llm_timeout_s) as client:
-            resp = client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            body = resp.json()
+        resp = get_client().post(url, json=payload, headers=headers, timeout=timeout or s.llm_timeout_s)
+        resp.raise_for_status()
+        body = resp.json()
         choice = body["choices"][0]
         content = (choice.get("message") or {}).get("content") or ""
         usage = body.get("usage") or {}
@@ -119,6 +140,168 @@ def default_llm_callable(settings: Settings | None = None) -> LLMCallable:
         )
 
     return _call
+
+
+# ------------------------------------------------------------------- 流式调用
+
+
+@dataclass(frozen=True)
+class StreamPiece:
+    """一段流式增量：正文片段 + 可选的 usage / 结束原因。
+
+    OpenAI 兼容的流里，usage 只在最后一个 data 块出现（需要带
+    stream_options.include_usage），中间的块只有 choices[0].delta.content。
+    所以计费口径随最后一个真实片段回来，而不是每块都带。
+    """
+
+    text: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    model: str = ""
+    finish_reason: str = ""
+
+
+class StreamFailed(RuntimeError):
+    """流式调用失败（网络 / HTTP / 数据块解析）。
+
+    为什么不在这里直接降级成一张卡：流可能已经发出去了，调用方需要知道
+    "是哪一段坏的"，而不是一张伪装成功的卡。能降级的地方只有两处——
+    finalize_stream（JSON 坏）与上层闸门 / 引用校验（ADR-4 的降级链）。
+    """
+
+
+# 注入点：messages -> 迭代器，逐段产出 StreamPiece 或 str。单测直接传假实现。
+StreamCallable = Callable[..., Iterator[Union[StreamPiece, str]]]
+
+
+def default_stream_callable(settings: Settings | None = None) -> StreamCallable:
+    """默认实现：DeepSeek /chat/completions + stream=true，逐行解析 SSE。
+
+    解析口径：`data: {json}` 每行一块，delta.content 是正文增量，`data: [DONE]` 结束。
+    任何一步不合预期都抛 StreamFailed——静默跳过坏块会被上层当成"模型就这么答的"，
+    那是最难查的一类故障。
+    """
+
+    def _call(
+        messages: list[dict[str, str]], *, timeout: float | None = None
+    ) -> Iterator[Union[StreamPiece, str]]:
+        s = settings or get_settings()
+        if not s.deepseek_api_key:
+            raise StreamFailed("DEEPSEEK_API_KEY 未配置，无法流式生成")
+        url = s.deepseek_base_url.rstrip("/") + "/chat/completions"
+        payload: dict[str, Any] = {
+            "model": s.llm_model,
+            "messages": messages,
+            "temperature": s.llm_temperature,
+            "max_tokens": s.llm_max_tokens,
+            "response_format": {"type": "json_object"},
+            "stream": True,
+            # 不带这个参数，流式响应里永远没有 usage，cost_cny 就只能记 0
+            "stream_options": {"include_usage": True},
+        }
+        _apply_thinking(payload, s)
+        headers = {"Authorization": "Bearer " + s.deepseek_api_key, "Content-Type": "application/json"}
+        client = get_client()
+        resp: Any = None
+        try:
+            request = client.build_request("POST", url, json=payload, headers=headers, timeout=timeout or s.llm_timeout_s)
+            resp = client.send(request, stream=True)
+            resp.raise_for_status()
+            for raw in resp.iter_lines():
+                line = (raw or "").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                if data == "[DONE]":
+                    return
+                try:
+                    body = json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise StreamFailed("流式数据块不是合法 JSON：" + str(exc)) from exc
+                if body.get("error"):
+                    raise StreamFailed("流式接口返回错误：" + str(body["error"])[:300])
+                usage = body.get("usage") or {}
+                choices = body.get("choices") or []
+                text = ""
+                finish = ""
+                if choices:
+                    choice = choices[0] or {}
+                    text = (choice.get("delta") or {}).get("content") or ""
+                    finish = str(choice.get("finish_reason") or "")
+                if text or usage or finish:
+                    yield StreamPiece(
+                        text=text,
+                        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                        completion_tokens=int(usage.get("completion_tokens") or 0),
+                        model=str(body.get("model") or s.llm_model),
+                        finish_reason=finish,
+                    )
+        except StreamFailed:
+            raise
+        except Exception as exc:  # 网络 / 超时 / 4xx / 5xx 统一包成 StreamFailed
+            raise StreamFailed("流式调用失败：" + type(exc).__name__ + ": " + str(exc)) from exc
+        finally:
+            # 共享连接池里的响应必须显式关闭，否则这条连接不会回到池子里
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:  # noqa: BLE001 - 关流失败不该覆盖真实错误
+                    pass
+
+    return _call
+
+
+class StreamSession(Iterator[str]):
+    """open_stream() 的返回值：既是 Iterator[str]，又带回 usage 与实际用到的块。
+
+    为什么要一个类而不是纯生成器：finalize_stream() 需要 prompt/completion tokens
+    与"这次真正喂进去的块"，普通生成器耗尽后交不出这两个数字；再让调用方按
+    字符数估一遍 token，等于把计费口径写第二遍。
+    """
+
+    def __init__(
+        self,
+        source: Iterator[Union[StreamPiece, str]],
+        *,
+        used: Sequence[ScoredChunk],
+        settings: Settings,
+    ):
+        self._source = source
+        self.used: list[ScoredChunk] = list(used)
+        self.settings = settings
+        self.parts: list[str] = []
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.model = settings.llm_model
+        self.finish_reason = ""
+
+    @property
+    def text(self) -> str:
+        """已经收到的全部正文（用于流结束后一次解析）。"""
+        return "".join(self.parts)
+
+    def __iter__(self) -> "StreamSession":
+        return self
+
+    def __next__(self) -> str:
+        while True:
+            # 耗尽时 StopIteration 自然向上抛（不吞掉，否则调用方会死循环）
+            item = next(self._source)
+            if isinstance(item, StreamPiece):
+                text = item.text or ""
+                if item.prompt_tokens:
+                    self.prompt_tokens = item.prompt_tokens
+                if item.completion_tokens:
+                    self.completion_tokens = item.completion_tokens
+                if item.model:
+                    self.model = item.model
+                if item.finish_reason:
+                    self.finish_reason = item.finish_reason
+            else:
+                text = item or ""
+            if text:
+                self.parts.append(text)
+                return text
 
 
 # ------------------------------------------------------------ 上下文（预算）
@@ -686,6 +869,113 @@ def _finalize(
     )
 
 
+# ------------------------------------------------------------ 流式（D5-A）
+
+
+def _parse_card(content: str) -> DiagnosisCard:
+    """模型输出 -> DiagnosisCard：规范化（_normalize_payload）+ Pydantic 校验。
+
+    抽成一个函数是为了让非流式的 generate() 与流式的 finalize_stream() 只有一处
+    解析口径：两处各写一遍，改一次字段规范就会出现"同步接口过了、流式接口还按
+    老口径"这种最难发现的分叉。
+    """
+    return DiagnosisCard.model_validate(_normalize_payload(_loads_json(content)))
+
+
+def open_stream(
+    query: str,
+    chunks: Sequence[ScoredChunk],
+    *,
+    settings: Settings | None = None,
+    llm: StreamCallable | None = None,
+) -> StreamSession:
+    """开一条流：准备上下文与 messages，返回逐段产出正文增量的 StreamSession。
+
+    与 generate() 共用 build_context + prompts.render_user_message 之前的所有逻辑
+    （上下文预算、每块必带 id、模型参数），差别只在调用方式：stream=true，逐段
+    yield 正文，首 token 时刻由调用方（stream_diagnose）记成 TTFT。
+
+    构造阶段的失败（没有候选块 / 预算放不下 / 没配密钥 / 连接失败）直接抛
+    StreamFailed：此时一个 delta 都还没发出去，上层可以干净地回 error 帧。
+    """
+    s = settings or get_settings()
+    query = (query or "").strip()
+    selected = list(chunks or [])
+    if not selected:
+        raise StreamFailed("没有候选块，无法流式生成")
+
+    # 固定开销（head/tail 模板）先从预算里扣掉，与 generate() 完全一致
+    overhead = len(prompts.render_user_message(query, []))
+    context_budget = max(MIN_CONTEXT_BUDGET, PROMPT_CHAR_BUDGET - overhead)
+    context_text, used = build_context(selected, budget=context_budget)
+    if not used:
+        raise StreamFailed("上下文预算不足：一块都放不下，应改走拒答")
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": prompts.SYSTEM_PROMPT},
+        {"role": "user", "content": prompts.render_user_message(query, [context_text])},
+    ]
+    call = llm or default_stream_callable(s)
+    try:
+        source = call(messages, timeout=s.llm_timeout_s)
+    except StreamFailed:
+        raise
+    except Exception as exc:
+        raise StreamFailed("流式调用失败：" + type(exc).__name__ + ": " + str(exc)) from exc
+    return StreamSession(iter(source), used=used, settings=s)
+
+
+def finalize_stream(
+    text: str,
+    chunks: Sequence[ScoredChunk],
+    *,
+    settings: Settings | None = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    started: float | None = None,
+    model: str = "",
+) -> DiagnosisCard:
+    """流结束后的收尾：完整正文 -> 一张卡（解析 / 规范化 / 引用过滤 / 限长 / 构造）。
+
+    复用非流式的同一条收尾链（_parse_card -> _finalize -> _enforce_limits /
+    _sanitize / _build_card），所以两条路径对"什么算合法引用、卡长什么样"的口径一致。
+
+    两个刻意的取舍：
+    - JSON 坏（半截、围栏、前后废话）-> degraded 卡，abort_reason 以 json_invalid
+      开头，不抛异常：流都发完了，客户端要的是能展示的卡，不是一个 500。
+    - chunks 为空 -> abstain 卡：没有候选块时模型的一切结论都无从校验。
+    """
+    s = settings or get_settings()
+    started = time.perf_counter() if started is None else started
+    used = list(chunks or [])
+    model = model or s.llm_model
+    if not used:
+        return _abstain_card([], "no_chunks", settings=s, started=started, model=model)
+    try:
+        card = _parse_card(text)
+    except (ValueError, ValidationError) as exc:
+        reason = "json_invalid: " + type(exc).__name__ + ": " + str(exc)
+        logger.warning("流式输出无法解析为诊断卡，降级：{}", reason)
+        return _degraded_card(
+            used,
+            reason,
+            settings=s,
+            started=started,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            model=model,
+        )
+    return _finalize(
+        card,
+        used,
+        settings=s,
+        started=started,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        model=model,
+    )
+
+
 # ------------------------------------------------------------------ 主入口
 
 
@@ -756,8 +1046,7 @@ def generate(
             break
 
         try:
-            payload = _normalize_payload(_loads_json(response.content))
-            card = DiagnosisCard.model_validate(payload)
+            card = _parse_card(response.content)
         except (ValueError, ValidationError) as exc:
             last_error = type(exc).__name__ + ": " + str(exc)
             logger.warning("M7 第 {} 次输出不可用：{}", attempt + 1, last_error)

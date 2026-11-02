@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -38,7 +39,18 @@ from bs4 import BeautifulSoup
 ROOT = Path(__file__).resolve().parent.parent
 CONTENT_DIR = ROOT / "content"
 UA = "oncall-copilot-corpus-bot/0.1 (+local research; contact: dev@example.com)"
-MIN_CHARS = 400
+MIN_CHARS = 400          # 低于此值的页面进入"短页判定"，不再直接丢弃
+SHORT_FLOOR = 150        # 低于此值视为空壳/错误页，仍然丢弃
+NAV_SELECTORS = (
+    ".td-sidebar", ".td-sidebar-nav", ".td-sidebar__inner", ".td-navbar", ".td-toc",
+    "#TableOfContents", ".td-page-meta", ".td-breadcrumbs", ".td-footer", ".breadcrumb",
+    ".feedback--answer", ".feedback--prompt", ".feedback--yes", ".feedback--no",
+    ".feedback--response", ".feedback--link", ".pageinfo", ".td-page-meta__lastmod",
+    "#search", ".search",
+    "[role=navigation]", "#sidebar", "#footer", "#nav", ".cookie", ".banner",
+)
+# 侧栏残留的指纹；命中说明容器没剔干净，走 fallback 重抽
+NAV_MARKERS = ("kubectl 参考", "本页目录", "Table of Contents", "文档目录")
 
 
 @dataclass
@@ -161,6 +173,48 @@ def clean_title(raw: str) -> str:
     return t.strip()
 
 
+def _nav_lines(soup: BeautifulSoup) -> set[str]:
+    """抽取前先记下侧栏/导航里的条目文本，用于抽取后逐行剔除残留。"""
+    lines: set[str] = set()
+    for node in soup.select(".td-sidebar-nav, .td-sidebar, nav, aside"):
+        for item in node.select("a, li"):
+            t = re.sub(r"\s+", " ", item.get_text(" ", strip=True))
+            if 4 <= len(t) <= 80:
+                lines.add(t)
+    return lines
+
+
+def _fallback_text(soup: BeautifulSoup) -> str:
+    """trafilatura 判死时的兜底：只取 main/.td-content 的可见文本。"""
+    node = soup.select_one("main") or soup.select_one(".td-content") or soup.body
+    if node is None:
+        return ""
+    for bad in node.select(
+        ".feedback--answer, .feedback--prompt, .feedback--yes, .feedback--no, "
+        ".feedback--response, .feedback--link, .pageinfo, .td-page-meta, .td-page-meta__lastmod, "
+        "a[href^='https://github.com/kubernetes/website/commit']"
+    ):
+        bad.decompose()
+    out: list[str] = []
+    prev: str | None = None
+    for line in node.get_text(chr(10), strip=True).splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line or line == prev:
+            continue
+        out.append(line)
+        prev = line
+    return (chr(10) * 2).join(out)
+
+
+def _is_index_page(md: str, soup: BeautifulSoup) -> bool:
+    """目录/落地页判定：链接密度高 + 有标题 + 体量小，才允许低于 MIN_CHARS 保留。"""
+    node = soup.select_one("main") or soup.select_one(".td-content") or soup
+    links = len(node.select("a[href]"))
+    plain = len(re.sub(r"\s+", "", md))
+    density = links / max(1, plain)
+    return len(node.select("h1, h2, h3")) >= 1 and len(md) < 1200 and (links >= 2 or density >= 0.02)
+
+
 class FetchError(RuntimeError):
     pass
 
@@ -262,7 +316,7 @@ class Crawler:
         return picked[: src.limit]
 
     # -- 抽取 --------------------------------------------------
-    def extract(self, url: str, html: str) -> tuple[str, str]:
+    def extract(self, url: str, html: str) -> tuple[str, str, str]:
         soup = BeautifulSoup(html, "lxml")
         title = ""
         h1 = soup.find("h1")
@@ -271,31 +325,47 @@ class Crawler:
         if not title and soup.title:
             title = soup.title.get_text(" ", strip=True)
         title = clean_title(title)
-        for tag in soup(["script", "style", "noscript", "nav", "header", "footer", "aside"]):
+
+        nav = _nav_lines(soup)
+        for tag in soup(["script", "style", "noscript", "nav", "header", "footer", "aside", "form"]):
             tag.decompose()
-        for sel in (
-            ".td-sidebar", ".td-navbar", ".td-toc", ".td-footer", "#search", ".search",
-            "[role=navigation]", ".breadcrumb", ".feedback--answer", ".pageinfo",
-            "#sidebar", "#footer", "#nav", ".cookie", ".banner",
-        ):
+        for sel in NAV_SELECTORS:
             for node in soup.select(sel):
                 node.decompose()
+
         md = trafilatura.extract(
             str(soup),
             output_format="markdown",
             include_tables=True,
             include_links=False,
             include_comments=False,
+            favor_recall=False,
             url=url,
         ) or ""
-        md = re.sub(r"\n{3,}", "\n\n", md).strip()
-        return title.strip(), md
+
+        # 1) 逐行剔除侧栏残留（容器万一没匹配上，这里兜底）
+        if nav and md:
+            kept = [ln for ln in md.splitlines() if ln.strip() not in nav]
+            if len(kept) != len(md.splitlines()):
+                md = chr(10).join(kept)
+
+        # 2) 仍有指纹或正文过短 → 只从 main/.td-content 重抽
+        if len(md) < MIN_CHARS or any(m in md for m in NAV_MARKERS):
+            alt = _fallback_text(soup)
+            if len(alt) > len(md):
+                md = alt
+
+        kind = "page"
+        if len(md) < MIN_CHARS:
+            kind = "index" if _is_index_page(md, soup) else "short"
+        md = re.sub(chr(10) + "{3,}", chr(10) * 2, md).strip()
+        return title.strip(), md, kind
 
 
 # ── 主流程 ──────────────────────────────────────────────────
 
 
-def write_doc(src: Source, url: str, title: str, md: str, force: bool) -> dict | None:
+def write_doc(src: Source, url: str, title: str, md: str, force: bool, kind: str = "page") -> dict | None:
     out_dir = CONTENT_DIR / src.name
     out_dir.mkdir(parents=True, exist_ok=True)
     slug = slugify(url)
@@ -313,6 +383,7 @@ def write_doc(src: Source, url: str, title: str, md: str, force: bool) -> dict |
         f"lang: {src.lang}\n"
         f"doc_hash: {digest}\n"
         f"chars: {len(md)}\n"
+        f"kind: {kind}\n"
         f"fetched_at: {stamp}\n"
         "---\n\n"
     )
@@ -326,16 +397,55 @@ def write_doc(src: Source, url: str, title: str, md: str, force: bool) -> dict |
         "lang": src.lang,
         "chars": len(md),
         "doc_hash": digest,
+        "kind": kind,
         "fetched_at": stamp,
     }
     upsert_index(out_dir, meta)
     return meta
 
 
+def _read_frontmatter(path: Path) -> dict:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    fm: dict = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        v = v.strip()
+        if v[:1] == '"':
+            try:
+                v = json.loads(v)
+            except json.JSONDecodeError:
+                pass
+        fm[k.strip()] = v
+    return fm
+
+
+def norm_url(url: str) -> str:
+    """规范化 URL：去尾斜杠、丢 query/fragment，用于识别同一篇的多种 slug。"""
+    parts = urlsplit(url)
+    path = parts.path.rstrip("/") or "/"
+    return f"{parts.scheme}://{parts.netloc}{path}"
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def upsert_index(out_dir: Path, meta: dict) -> None:
-    """写或更新 index.jsonl 里该 slug 的一行：--force 重抓不会产生重复行。"""
+    """按 slug（兼按规范化 URL）upsert：同一篇只保留一行，--force 重抓不追加。
+
+    全量读入 → 覆盖同 slug 行、删掉同 URL 的旧 slug 行 → 排序后写 .tmp 再 os.replace，
+    中断不会留下半截 index.jsonl。
+    """
     path = out_dir / "index.jsonl"
-    kept: list[str] = []
+    rows: dict[str, dict] = {}
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -344,11 +454,47 @@ def upsert_index(out_dir: Path, meta: dict) -> None:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
-                continue  # 半截行（上次中断）直接丢
-            if row.get("slug") != meta["slug"]:
-                kept.append(line)
-    kept.append(json.dumps(meta, ensure_ascii=False))
-    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+                continue
+            if isinstance(row, dict) and row.get("slug"):
+                rows[row["slug"]] = row
+
+    key = meta["slug"]
+    target = norm_url(meta["url"])
+    for slug in [s for s, r in rows.items() if s != key and norm_url(r.get("url", "")) == target]:
+        rows.pop(slug)
+    rows[key] = meta
+    body = "".join(json.dumps(rows[k], ensure_ascii=False) + chr(10) for k in sorted(rows))
+    _atomic_write(path, body)
+
+
+def rebuild_index(out_dir: Path) -> tuple[int, int]:
+    """以 md frontmatter 为准重建 index.jsonl，清掉历史重复/孤儿行。返回 (篇数, 旧行数)。"""
+    path = out_dir / "index.jsonl"
+    old = 0
+    if path.exists():
+        old = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    rows: dict[str, dict] = {}
+    for md in sorted(out_dir.glob("*.md")):
+        fm = _read_frontmatter(md)
+        if not fm.get("url"):
+            continue
+        try:
+            chars = int(fm.get("chars") or 0)
+        except (TypeError, ValueError):
+            chars = 0
+        rows[md.stem] = {
+            "slug": md.stem,
+            "source": fm.get("source", out_dir.name),
+            "url": fm.get("url", ""),
+            "title": fm.get("title", ""),
+            "lang": fm.get("lang", ""),
+            "chars": chars,
+            "doc_hash": fm.get("doc_hash", ""),
+            "fetched_at": fm.get("fetched_at", ""),
+        }
+    body = "".join(json.dumps(rows[k], ensure_ascii=False) + chr(10) for k in sorted(rows))
+    _atomic_write(path, body)
+    return len(rows), old
 
 
 def run(
@@ -360,7 +506,10 @@ def run(
     force: bool,
     only: set[str] | None = None,
 ) -> dict:
-    stats = {"source": src.name, "found": 0, "saved": 0, "skipped": 0, "failed": 0, "chars": 0}
+    stats = {
+        "source": src.name, "found": 0, "saved": 0, "skipped": 0,
+        "failed": 0, "chars": 0, "short_kept": 0,
+    }
     try:
         urls = crawler.discover(src)
     except Exception as exc:
@@ -390,17 +539,20 @@ def run(
             continue
         try:
             resp = crawler.get(url)
-            title, md = crawler.extract(url, resp.text)
-            if len(md) < MIN_CHARS:
+            title, md, kind = crawler.extract(url, resp.text)
+            if not md or (len(md) < MIN_CHARS and kind != "index"):
                 log(f"{prefix} 正文过短({len(md)} 字)，跳过 {url}")
                 stats["skipped"] += 1
                 continue
+            if kind == "index":
+                stats["short_kept"] += 1
+                log(f"{prefix} 短目录页保留({len(md)} 字) {url}")
             digest = sha256(md)
             if digest in hashes:
                 stats["skipped"] += 1
                 continue
             hashes.add(digest)
-            meta = write_doc(src, url, title, md, force)
+            meta = write_doc(src, url, title, md, force, kind=kind)
             if meta is None:
                 stats["skipped"] += 1
                 continue
@@ -426,6 +578,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="只列出将要抓取的 URL")
     ap.add_argument("--force", action="store_true", help="已存在的文件也重新抓取")
     ap.add_argument(
+        "--rebuild-index",
+        action="store_true",
+        help="以 md frontmatter 为准重建 index.jsonl（清重复/孤儿行，不联网）",
+    )
+    ap.add_argument(
         "--only",
         default=None,
         help="只处理这些篇：逗号分隔的 slug 或完整 URL（配合 --force 修单篇）",
@@ -437,6 +594,12 @@ def main(argv: list[str] | None = None) -> int:
     if unknown:
         log(f"未知源: {', '.join(unknown)}；可用: {', '.join(SOURCES)}")
         return 2
+
+    if args.rebuild_index:
+        for name in names:
+            md_n, old_n = rebuild_index(CONTENT_DIR / name)
+            log(f"[{name}] index 重建: 旧 {old_n} 行 → {md_n} 行")
+        return 0
 
     only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
     crawler = Crawler(delay=args.delay)
@@ -454,9 +617,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     log("\n" + "=" * 58)
-    log(f"{'源':<8}{'候选':>6}{'新增':>6}{'跳过':>6}{'失败':>6}{'总字数':>9}")
+    log(f"{'源':<8}{'候选':>6}{'新增':>6}{'短页保留':>8}{'跳过':>6}{'失败':>6}{'总字数':>9}")
     for r in results:
-        log(f"{r['source']:<8}{r['found']:>6}{r['saved']:>6}{r['skipped']:>6}{r['failed']:>6}{r['chars']:>9}")
+        log(f"{r['source']:<8}{r['found']:>6}{r['saved']:>6}{r['short_kept']:>8}"
+            f"{r['skipped']:>6}{r['failed']:>6}{r['chars']:>9}")
     total_saved = sum(r["saved"] for r in results)
     total_chars = sum(r["chars"] for r in results)
     log(f"\n合计新增 {total_saved} 篇 / {total_chars} 字 → {CONTENT_DIR}")

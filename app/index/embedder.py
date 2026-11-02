@@ -24,6 +24,9 @@ import httpx
 from loguru import logger
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
+from app.core.http_client import get_client
+
+
 class FatalEmbeddingError(RuntimeError):
     """不可重试的错误（401/403/404/400）：重试只会多烧额度。"""
 
@@ -127,8 +130,7 @@ class Embedder:
         payload = {"model": self.model, "input": texts}
         headers = {"Authorization": "Bearer " + self.api_key, "Content-Type": "application/json"}
         started = time.perf_counter()
-        with httpx.Client(timeout=self.timeout) as client:
-            resp = client.post(self.base_url + "/embeddings", json=payload, headers=headers)
+        resp = get_client().post(self.base_url + "/embeddings", json=payload, headers=headers, timeout=self.timeout)
         self.request_ms += (time.perf_counter() - started) * 1000
         if resp.status_code != 200:
             detail = resp.text[:300]
