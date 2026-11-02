@@ -214,7 +214,9 @@ def test_regenerate_once_then_degraded():
     assert done["regenerated"] is True
     assert done["card"]["degraded"] is True
     assert done["card"]["causes"] == []
-    assert "引用校验未通过" in done["card"]["summary"]
+    assert "引用全部未通过校验" in done["card"]["summary"]
+    assert done["card"]["abstained"] is True
+    assert done["card"]["abort_reason"] == "citations_invalid"
     # 帧名仍然只有约定内的五种
     assert {event for event, _ in collected} <= {"meta", "citations", "delta", "done", "error"}
 

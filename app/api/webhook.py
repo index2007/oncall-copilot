@@ -21,7 +21,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from loguru import logger
 from starlette.concurrency import run_in_threadpool
 
@@ -91,11 +91,20 @@ def build_diagnosis_text(alert: WebhookAlert) -> str:
     return "\n".join(lines)
 
 
-def _log_alert(db: DB, *, text: str, card: Any, latency_ms: int, status: str) -> None:
+def _log_alert(
+    db: DB,
+    *,
+    request_id: str,
+    text: str,
+    card: Any,
+    latency_ms: int,
+    status: str,
+    abstained_at: str | None = None,
+) -> None:
     """落一行 query_log；写日志失败不许把告警请求带崩（与 db.log_query 的约定一致）。"""
     try:
         db.log_query(
-            request_id=new_request_id(),
+            request_id=request_id,
             endpoint="/webhook/alertmanager",
             query=text,
             answer_len=len(getattr(card, "summary", "") or ""),
@@ -106,6 +115,7 @@ def _log_alert(db: DB, *, text: str, card: Any, latency_ms: int, status: str) ->
             prompt_tokens=int(getattr(card, "prompt_tokens", 0) or 0),
             completion_tokens=int(getattr(card, "completion_tokens", 0) or 0),
             cost_cny=float(getattr(card, "cost_cny", 0.0) or 0.0),
+            abstained_at=abstained_at,
         )
     except Exception as exc:  # noqa: BLE001 - 可观测性不能反噬主流程
         logger.warning("webhook 落 query_log 失败：{}: {}", type(exc).__name__, exc)
@@ -114,10 +124,12 @@ def _log_alert(db: DB, *, text: str, card: Any, latency_ms: int, status: str) ->
 @router.post("/webhook/alertmanager", response_model=WebhookResponse, summary="Alertmanager v4 告警入口")
 async def receive_alertmanager(
     payload: WebhookPayload,
+    request: Request,
     db: DB = Depends(get_db),
     diagnoser: Diagnoser = Depends(get_diagnoser),
 ) -> WebhookResponse:
     started_all = time.perf_counter()
+    request_id = getattr(request.state, "request_id", None) or new_request_id()
     accepted = 0
     skipped = 0
     processed = 0
@@ -140,10 +152,13 @@ async def receive_alertmanager(
             severity=alert.labels.get("severity", ""),
         )
         card: Any = None
+        abstained_at: str | None = None
         started = time.perf_counter()
         try:
             result = await run_in_threadpool(diagnoser.run, text)
             card = result.card
+            # 假诊断器（测试/外部实现）可能没有这个字段，缺了就当没记
+            abstained_at = getattr(result, "abstained_at", None)
             row.diagnosis_id = card.diagnosis_id
             row.abstained = bool(card.abstained)
             row.causes = [cause.title for cause in card.causes]
@@ -163,10 +178,12 @@ async def receive_alertmanager(
         row.latency_ms = int((time.perf_counter() - started) * 1000)
         _log_alert(
             db,
+            request_id=request_id,
             text=text,
             card=card,
             latency_ms=row.latency_ms,
             status="ok" if card is not None else "error",
+            abstained_at=abstained_at,
         )
         results.append(row)
 

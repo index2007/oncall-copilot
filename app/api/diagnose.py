@@ -10,7 +10,7 @@ JSON，是最难排查的一类"看起来成功"的故障；400 把用哪个端�
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.api.ask import run_diagnose
 from app.api.deps import get_db, get_diagnoser
@@ -27,6 +27,7 @@ ENDPOINT = "/v1/diagnose"
 @router.post("/v1/diagnose", response_model=DiagnoseResponse)
 async def diagnose_query(
     req: AskRequest,
+    request: Request,
     db: DB = Depends(get_db),
     diagnoser: Diagnoser = Depends(get_diagnoser),
 ) -> DiagnoseResponse:
@@ -39,7 +40,7 @@ async def diagnose_query(
     return await run_diagnose(
         diagnoser,
         req,
-        request_id=new_request_id(),
+        request_id=getattr(request.state, "request_id", None) or new_request_id(),
         db=db,
         endpoint=ENDPOINT,
     )

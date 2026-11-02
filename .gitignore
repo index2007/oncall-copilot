@@ -8,6 +8,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 pytest-cache-files-*/
+pytest-of-*/
+pytest-*/
 jieba.cache
 
 # 密钥
@@ -15,6 +17,9 @@ jieba.cache
 
 # 文档（讲解手册 / 流程图 / 参考链接，本机留存，不进 git）
 docs/
+
+# 评测 judge 缓存（key 是 gold+候选的 hash，避免重复付费）
+eval/.judge_cache.json
 
 # 临时
 *.log

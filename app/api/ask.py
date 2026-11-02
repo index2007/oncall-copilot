@@ -22,7 +22,7 @@ import threading
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from loguru import logger
 from sse_starlette.sse import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
@@ -110,6 +110,10 @@ async def run_diagnose(
         prompt_tokens=result.card.prompt_tokens,
         completion_tokens=result.card.completion_tokens,
         cost_cny=float(result.card.cost_cny or 0.0),
+        # 分段耗时与拒答来源落库：/v1/metrics/summary 的 stages / abstain_sources 靠这两列，
+        # 不落库就只能现算，事后无法复现"P50 里检索占多少"。
+        timings_json=json.dumps(result.timings.as_dict(), ensure_ascii=False),
+        abstained_at=result.abstained_at,
     )
     return resp
 
@@ -162,8 +166,20 @@ def _sse_response(
                 gen.close()
                 put(sentinel)
 
-        # 生产端在线程里跑；这里不 await 它，消费端只认队列
-        future = loop.run_in_executor(None, pump)  # noqa: F841 - 仅用于持有引用
+        # 生产端在线程里跑；消费端只认队列（不等这个 future，否则首字要等整卡结束）。
+        # 线程无法被强杀：客户端断开时只能置 stop 让它在下一次 put 前收手，
+        # 最坏情况要等当前这次 LLM 读超时（llm_timeout_s）。
+        future = loop.run_in_executor(None, pump)
+
+        def _on_pump_done(fut: Any) -> None:
+            # 取一次异常，避免线程里逃出来的异常变成 "exception was never retrieved"
+            if fut.cancelled():
+                return
+            exc = fut.exception()
+            if exc is not None:
+                logger.warning("流式生产端退出 rid={}: {}: {}", request_id, type(exc).__name__, exc)
+
+        future.add_done_callback(_on_pump_done)
 
         try:
             while True:
@@ -178,6 +194,8 @@ def _sse_response(
                 elif event == "done":
                     state["card"] = data.get("card") or {}
                     state["hit_ids"] = data.get("hit_chunk_ids") or []
+                    state["timings"] = data.get("timings") or {}
+                    state["abstained_at"] = data.get("abstained_at")
                 elif event == "error":
                     state["status"] = "error"
                 yield {"event": event, "data": json.dumps(data, ensure_ascii=False)}
@@ -187,6 +205,8 @@ def _sse_response(
             raise
         finally:
             stop.set()
+            if not future.done():
+                future.cancel()  # 已在跑时是 no-op；至少拦住还没开始执行的情况
             card = state.get("card") or {}
             plan = state.get("plan") or {}
             log_query_safe(
@@ -210,6 +230,8 @@ def _sse_response(
                 prompt_tokens=int(card.get("prompt_tokens") or 0),
                 completion_tokens=int(card.get("completion_tokens") or 0),
                 cost_cny=float(card.get("cost_cny") or 0.0),
+                timings_json=json.dumps(state.get("timings") or {}, ensure_ascii=False),
+                abstained_at=state.get("abstained_at"),
             )
 
     return EventSourceResponse(frames(), headers=SSE_HEADERS)
@@ -218,11 +240,16 @@ def _sse_response(
 @router.post("/v1/ask")
 async def ask(
     req: AskRequest,
+    request: Request,
     db: DB = Depends(get_db),
     diagnoser: Diagnoser = Depends(get_diagnoser),
 ):
-    """一次问诊：stream=false 返回 DiagnoseResponse；stream=true 返回 SSE。"""
-    request_id = new_request_id()
+    """一次问诊：stream=false 返回 DiagnoseResponse；stream=true 返回 SSE。
+
+    request_id 必须复用中间件生成的那个，否则响应头 X-Request-ID、query_log
+    与日志里的 rid 会变成三个不同的值。
+    """
+    request_id = getattr(request.state, "request_id", None) or new_request_id()
     if not req.stream:
         return await run_diagnose(diagnoser, req, request_id=request_id, db=db, endpoint=ENDPOINT)
     return _sse_response(diagnoser, req, request_id, db)

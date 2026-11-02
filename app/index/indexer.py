@@ -131,9 +131,10 @@ def index_incremental(
         report.elapsed_s = time.perf_counter() - started
         return report
 
-    known = db.doc_rows(include_deleted=True)
-    if full:
-        known = {}
+    # full 也要先读一次旧状态：删掉的数字（这次全量扫描相对上次少了哪些文档）
+    # 只能拿旧库比出来，清库之后再比就永远是 0。
+    known_before = db.doc_rows(include_deleted=True)
+    known = {} if full else known_before
 
     on_disk = {e.doc.doc_id for e in entries}
     changed: list[_DocEntry] = []
@@ -152,7 +153,9 @@ def index_incremental(
 
     deleted_ids: list[str] = []
     if limit is None:
-        deleted_ids = sorted(d for d, row in known.items() if d not in on_disk and not row.get("is_deleted"))
+        deleted_ids = sorted(
+            d for d, row in known_before.items() if d not in on_disk and not row.get("is_deleted")
+        )
 
     logger.info(
         "scan docs={} changed={} (added={} updated={}) deleted={} skipped={}",
@@ -209,6 +212,12 @@ def index_incremental(
         report.cost_cny = embedder.cost_cny
 
     # 3) 向量库：删除已消失的文档 + 重建变更文档
+    # 全量重建要先清空：否则上次索引过、这次已从语料删除的文档，其向量会永久留在表里，
+    # 检索照样能召回（documents 表标记了 is_deleted，但向量库不认这个标记）。
+    if full:
+        store.drop()
+        store.table(create=True)
+        db.clear()
     for start in range(0, len(deleted_ids), 100):
         store.delete_docs(deleted_ids[start : start + 100])
     for entry in changed:

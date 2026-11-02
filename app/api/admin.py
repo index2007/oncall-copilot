@@ -61,7 +61,7 @@ async def admin_index(
             dry_run=req.dry_run,
             trigger="api",
         )
-    except Exception as exc:  # noqa: BLE001 - 统一转 500，异常原文回给调用方
+    except Exception as exc:  # noqa: BLE001 - 统一转 500；原因只进日志，不回给调用方
         logger.exception("admin/index 失败：{}", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="internal error") from exc
     return _to_response(report)

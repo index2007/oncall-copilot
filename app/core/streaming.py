@@ -98,6 +98,7 @@ def _done_payload(
     report: CitationReport | None,
     regenerated: bool,
     hits: list[ScoredChunk] | None = None,
+    abstained_at: str | None = None,
 ) -> dict[str, Any]:
     """done 帧：与 /v1/ask 非流式响应同源的那张卡 + 流式专属的三个数。
 
@@ -112,6 +113,8 @@ def _done_payload(
         "timings": timings.as_dict(),
         "report": report.model_dump() if report is not None else None,
         "regenerated": regenerated,
+        # 拒答来源：gate=没调 LLM，generator=调了但证据/引用不过；未拒答为 null
+        "abstained_at": abstained_at,
         # 原始召回集：帧契约里原本没有，但流式也要落 query_log 的 hit_chunk_ids。
         # 加一个客户端可忽略的字段，比让日志少一列、事后查不出"到底召回了什么"更值。
         "hit_chunk_ids": [c.chunk_id for c in (hits or []) if c.chunk_id],
@@ -196,7 +199,15 @@ def stream_diagnose(
         card = card.model_copy(update={"latency_ms": int(timings.total_ms)})
         yield (
             "done",
-            _done_payload(card, ttft_ms=None, timings=timings, report=None, regenerated=False, hits=hits),
+            _done_payload(
+                card,
+                ttft_ms=None,
+                timings=timings,
+                report=None,
+                regenerated=False,
+                hits=hits,
+                abstained_at="gate",
+            ),
         )
         return
 
@@ -294,10 +305,12 @@ def stream_diagnose(
         return
 
     if report is not None and not report.ok:
-        # 两次都没过：放弃模型结论，只回原文片段（ADR-4 最后一档）。abstained 归 False——
-        # 这次不是"没证据所以拒绝作答"，而是"有证据但模型在编引用"，计入 degrade 而不是 abstain，
-        # 否则观测侧的拒答率会被幻觉引用污染。
-        card = _degraded_card(card, context, report).model_copy(update={"abstained": False})
+        # 两次都没过：按 ADR-5② 拒答，只回原文片段（ADR-4 最后一档）。abstained 与
+        # degraded 同时置真——前者是"没有可信答案"，后者是"答案是被引用校验拦下的"，
+        # 两者语义不互斥，观测侧靠 abort_reason=citations_invalid 区分。
+        card = _degraded_card(card, context, report).model_copy(
+            update={"abstained": True, "abort_reason": "citations_invalid"}
+        )
     if rerank_degraded:
         card = card.model_copy(update={"degraded": True})
 
@@ -305,5 +318,13 @@ def stream_diagnose(
     card = card.model_copy(update={"latency_ms": int(timings.total_ms), "ttft_ms": ttft_ms})
     yield (
         "done",
-        _done_payload(card, ttft_ms=ttft_ms, timings=timings, report=report, regenerated=regenerated, hits=hits),
+        _done_payload(
+            card,
+            ttft_ms=ttft_ms,
+            timings=timings,
+            report=report,
+            regenerated=regenerated,
+            hits=hits,
+            abstained_at="generator" if card.abstained else None,
+        ),
     )

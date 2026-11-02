@@ -169,3 +169,43 @@ def test_timings_and_summary_row():
 def test_stage_timing_defaults_zero():
     t = StageTiming()
     assert t.as_dict()["total_ms"] == 0.0
+
+
+def test_llm_abstain_marks_generator_stage():
+    """模型自己判断证据不足而拒答时，abstained_at 要能区分出是生成侧，不是闸门。"""
+    card = DiagnosisCard(abstained=True, summary="证据不足", causes=[], abort_reason="insufficient_evidence")
+    gen = fake_generate_factory([card])
+    d = Diagnoser(FakeRetriever([make_chunk("c_1", rerank=0.9)]), settings(), rerank_fn=fake_rerank(), generate_fn=gen)
+    res = d.run("Pod 一直 Pending")
+    assert res.card.abstained is True
+    assert res.abstained_at == "generator"
+    assert len(gen.calls) == 1
+
+
+def test_citations_invalid_stays_abstained_and_marks_degraded():
+    """ADR-5②：引用全落空是拒答；同时置 degraded，才能与"检索不到"分开统计。"""
+    card = DiagnosisCard(abstained=True, summary="引用无效", causes=[], abort_reason="citations_invalid")
+    gen = fake_generate_factory([card])
+    d = Diagnoser(FakeRetriever([make_chunk("c_1", rerank=0.9)]), settings(), rerank_fn=fake_rerank(), generate_fn=gen)
+    res = d.run("Pod 一直 Pending")
+    assert res.card.abstained is True
+    assert res.card.degraded is True
+    assert res.abstained_at == "generator"
+
+
+def test_guard_failure_abstains_after_one_regeneration():
+    """两次校验都不过 -> 拒答 + degraded，原因记 citations_invalid（ADR-4 最后一档）。"""
+    bad = DiagnosisCard(
+        summary="编了引用",
+        causes=[Cause(title="磁盘满", confidence=0.4, evidence=[Evidence(chunk_id="c_fake")])],
+    )
+    gen = fake_generate_factory([bad, bad])
+    d = Diagnoser(FakeRetriever([make_chunk("c_1", rerank=0.9)]), settings(), rerank_fn=fake_rerank(), generate_fn=gen)
+    res = d.run("Pod 一直 Pending")
+    assert len(gen.calls) == 2
+    assert res.regenerated is True
+    assert res.card.abstained is True
+    assert res.card.degraded is True
+    assert res.card.abort_reason == "citations_invalid"
+    assert res.card.causes == []
+

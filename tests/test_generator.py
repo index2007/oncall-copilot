@@ -293,11 +293,6 @@ def test_empty_chunks_skips_llm(monkeypatch, settings):
     assert card.abort_reason == "no_chunks"
 
 
-def test_stream_not_implemented(chunks, settings):
-    with pytest.raises(NotImplementedError):
-        generator.generate(QUERY, chunks, stream=True, settings=settings)
-
-
 def test_llm_exception_degrades_without_retry(monkeypatch, chunks, settings):
     fake = _install(monkeypatch, FakeLLM(RuntimeError("connection reset")))
     card = generator.generate(QUERY, chunks, settings=settings)

@@ -824,6 +824,18 @@ def _enforce_limits(card: DiagnosisCard) -> DiagnosisCard:
     )
 
 
+def sanitize_card(card: DiagnosisCard, used: Sequence[ScoredChunk]) -> DiagnosisCard:
+    """后置过滤的公开入口：丢掉指向本次上下文之外资料的 cause / citation。
+
+    给编排层用——它必须先校验模型原始输出、重生成之后再净化，否则"校验恒通过"。
+    只改 causes / citations，summary、成本、耗时原样保留。
+    """
+    causes, citations, dropped = _sanitize(card, used)
+    if dropped:
+        logger.info("丢弃 {} 条引用了不存在资料的结论", dropped)
+    return card.model_copy(update={"causes": causes, "citations": citations})
+
+
 def _finalize(
     card: DiagnosisCard,
     used: Sequence[ScoredChunk],
@@ -833,8 +845,27 @@ def _finalize(
     prompt_tokens: int,
     completion_tokens: int,
     model: str,
+    sanitize: bool = True,
 ) -> DiagnosisCard:
     card = _enforce_limits(card)
+    if not sanitize:
+        # 编排层要拿"模型原始输出"去跑引用校验（ADR-4）：先净化再校验等于自己问自己，
+        # 恒通过。true 的原样返回未净化的 causes/citations，净化留给调用方在重生成之后做。
+        return _build_card(
+            summary=card.summary,
+            causes=list(card.causes),
+            verify_commands=_clean_commands(card.verify_commands),
+            actions=list(card.actions),
+            citations=list(card.citations),
+            abstained=bool(card.abstained),
+            degraded=False,
+            abort_reason=card.abort_reason,
+            settings=settings,
+            started=started,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            model=model,
+        )
     causes, citations, dropped = _sanitize(card, used)
     commands = _clean_commands(card.verify_commands)
     if dropped:
@@ -983,9 +1014,9 @@ def generate(
     query: str,
     chunks: Sequence[ScoredChunk],
     *,
-    stream: bool = False,
     settings: Settings | None = None,
     llm: LLMCallable | None = None,
+    sanitize: bool = True,
 ) -> DiagnosisCard:
     """把候选块生成一张诊断卡。
 
@@ -993,9 +1024,6 @@ def generate(
     失败分两档——JSON/schema 坏且重试后仍坏 -> degraded 卡；资料不足以支撑
     结论 -> abstained 卡。两者都不编造原因。
     """
-    if stream:
-        raise NotImplementedError("流式生成未接入：当前只提供非流式整卡（/diagnose）")
-
     started = time.perf_counter()
     s = settings or get_settings()
     call = llm or default_llm_callable(s)
@@ -1066,6 +1094,7 @@ def generate(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             model=model,
+            sanitize=sanitize,
         )
 
     return _degraded_card(

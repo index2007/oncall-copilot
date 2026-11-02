@@ -76,10 +76,6 @@ class SSEFrame(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
-class AskResponse(DiagnoseResponse):
-    """目前与 DiagnoseResponse 同构；保留独立名字，方便以后只调一处。"""
-
-
 class SourceResponse(BaseModel):
     """GET /v1/sources/{chunk_id}：一段原文 + 可点开的 url。"""
 
@@ -134,6 +130,10 @@ class MetricsSummaryResponse(BaseModel):
     total_cost_cny: float = 0.0
     avg_completion_tokens: float = 0.0
     by_endpoint: dict[str, int] = Field(default_factory=dict)
+    # 分阶段耗时（query_understanding / retrieve / rerank / generate / verify，毫秒）
+    # 与拒答来源（gate = 没调 LLM 就拒了；generator = 调了但证据/引用不过）。
+    stages: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    abstain_sources: dict[str, int] = Field(default_factory=dict)
     index: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -375,7 +375,9 @@ def test_admin_index_failure_returns_500(tmp_path, monkeypatch):
     resp = make_client(settings=settings).post("/v1/admin/index", json={})
 
     assert resp.status_code == 500
-    assert "embedding 失败" in resp.json()["detail"]
+    # 内部异常原文只进日志，不回给调用方（与 main.py 的 500 口径一致）
+    assert resp.json()["detail"] == "internal error"
+    assert "embedding 失败" not in resp.text
 
 
 # ---------------------------------------------------------------------------

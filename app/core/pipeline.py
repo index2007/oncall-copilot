@@ -53,7 +53,7 @@ class DiagnoseResult:
     context: list[ScoredChunk] = field(default_factory=list)
     report: CitationReport | None = None
     timings: StageTiming = field(default_factory=StageTiming)
-    abstained_at: str | None = None  # gate / llm / None
+    abstained_at: str | None = None  # gate / generator / None
     regenerated: bool = False
 
     @property
@@ -95,13 +95,34 @@ def _abstain_card(plan: QueryPlan, hits: list[ScoredChunk], reason: str, top_sco
 
 
 def _degraded_card(card: DiagnosisCard, context: list[ScoredChunk], report: CitationReport) -> DiagnosisCard:
-    """引用校验两次都不过：放弃模型结论，直接回原文片段（ADR-4 的最后一档）。"""
-    lines: list[str] = ["引用校验未通过，已降级为原文片段（不做推理）："]
+    """引用校验两次都不过：拒答 + 只回原文片段（ADR-4 最后一档 / ADR-5②）。
+
+    abstained=True 是 ADR-5② 的原话（"引用全落空 → 拒答"）：模型给了结论但一条都
+    落不到资料上，等于没答。degraded=True 同时置上，观测侧才能把这种拒答与"检索不到"
+    分开统计；causes 清空，客户端只会看到原文片段。
+    """
+    lines: list[str] = ["模型结论的引用全部未通过校验，按设计拒绝猜测（只回原文片段）："]
     for i, c in enumerate(context[:3], start=1):
         lines.append(str(i) + ". " + c.preview(120))
     bad = ", ".join(report.invalid_ids[:5]) if report.invalid_ids else "（有结论缺证据）"
     lines.append("未通过的引用：" + bad)
-    return card.model_copy(update={"degraded": True, "causes": [], "summary": "\n".join(lines)})
+    return card.model_copy(
+        update={
+            "abstained": True,
+            "degraded": True,
+            "causes": [],
+            "citations": list(card.citations),
+            "abort_reason": "citations_invalid",
+            "summary": "\n".join(lines),
+        }
+    )
+
+
+def _sanitize_card(card: DiagnosisCard, context: list[ScoredChunk]) -> DiagnosisCard:
+    """校验通过后的净化：证据指向不存在块的 cause 整条丢掉。"""
+    from app.core.generator import sanitize_card
+
+    return sanitize_card(card, context)
 
 
 class Diagnoser:
@@ -189,13 +210,24 @@ class Diagnoser:
             result.regenerated = True
 
         if report is not None and not report.ok and not card.abstained:
+            # ADR-5②：引用全落空 → 拒答（不是"降级成原文片段但仍然作答"）。degraded
+            # 同时置 True，观测侧才能区分"没证据拒答"与"模型编引用被拦下"。
             card = _degraded_card(card, context, report)
 
-        # 生成器内部把"引用全丢"记成 abstained + abort_reason=citations_invalid。那其实是
-        # "有证据但模型在编引用"，不是"没证据所以拒答"：与流式路径（streaming.py 同样置
-        # abstained=False）保持一致，归到 degraded，否则观测侧的拒答率会被幻觉引用污染。
+        # 通过校验的卡才净化：把证据指向不存在块的 cause 整条丢掉（ADR-4 后置过滤）。
+        # 校验已在原始卡上做过，这里的净化只负责"展示的卡不出现编造的引用"。
+        if report is not None and report.ok and not card.abstained and not card.degraded:
+            card = _sanitize_card(card, context)
+
+        # 生成器自己判"引用全落空"（sanitize=True 那条路）时已经 abstain，这里补上
+        # degraded，保证两种入口（编排层两次校验失败 / 生成器内部判定）在观测上同形。
         if card.abstained and card.abort_reason == "citations_invalid":
-            card = card.model_copy(update={"abstained": False, "degraded": True})
+            card = card.model_copy(update={"degraded": True})
+
+        # 生成侧自己的拒答（模型认为证据不足）要能区分出来：观测侧看
+        # gate 拒答 = 没调 LLM，generator 拒答 = 调了但模型判断证据不够。
+        if card.abstained and result.abstained_at is None:
+            result.abstained_at = "generator"
 
         if rerank_degraded:
             card = card.model_copy(update={"degraded": True})
@@ -207,15 +239,16 @@ class Diagnoser:
 
 
 def _top_score(chunks: list[ScoredChunk]) -> float | None:
-    """拒答判定用的分数：优先 rerank_score，没有就用融合分。"""
-    if not chunks:
-        return None
-    best = chunks[0]
-    return best.rerank_score if best.rerank_score is not None else best.score
+    """拒答判定用的分数（回退规则只在 guard.best_score 一处实现）。"""
+    return guard_mod.best_score(chunks)
 
 
 def generate_default(query: str, chunks: list[ScoredChunk]) -> DiagnosisCard:
-    """默认生成实现（延迟导入：没配密钥时也不该在 import 阶段炸）。"""
+    """默认生成实现（延迟导入：没配密钥时也不该在 import 阶段炸）。
+
+    sanitize=False：把模型原始输出交给编排层做引用校验（ADR-4），否则拿已净化的卡
+    去"校验"永远通过，重生成分支是死代码。净化在重生成之后、返回之前做。
+    """
     from app.core.generator import generate
 
-    return generate(query, chunks)
+    return generate(query, chunks, sanitize=False)

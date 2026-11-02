@@ -2,7 +2,7 @@
 
 > 把「线上出事了」这句求助，变成一张可机读、带引用的结构化诊断卡。
 
-**状态**：D5 完成（M0-M5 + 全部 7 个接口 + SSE + 日志），D6-D10 未开工。指标数字一律来自可重跑的脚本；未实测的写「待 D7」，不填预计值。
+**状态**：D6 完成（M0-M5 + 7 接口 + SSE + 日志 + M10 评测集与脚本），D7-D10 未开工。指标数字一律来自可重跑的脚本；未实测的写「待 D7」，不填预计值。
 
 ```
 报错文本 / Alertmanager 告警
@@ -312,6 +312,8 @@ data: {"card":{"diagnosis_id":"dg_...","abstained":false,"causes":[...],"verify_
 
 请求体同 7.1；**`stream=true` 会被 400 拒绝**，提示改用 `/v1/ask`。响应：
 
+响应是**信封式**的（卡放在 `card` 字段里，同时带上 `plan` / `report` / `timings`）。设计清单 §7 只写了「结构化诊断卡」，没写信封；取舍是结论与过程证据分开摆：要卡就取 `card`，要可观测就取 `timings`。代价是客户端多解一层，好处是与 `/v1/ask` 流式 `done` 帧（同构）共用一套解析代码。
+
 | 字段 | 说明 |
 |---|---|
 | `diagnosis_id` | 本次诊断 id（`dg_YYYYMMDD_xxxx`） |
@@ -390,7 +392,9 @@ curl 'http://127.0.0.1:8000/v1/sources/c_c97fd0c9d2'
 |---|---|---|
 | `window` | 1-2000 | 统计最近 N 次请求；缺省取 `METRICS_WINDOW=200`，超出会被夹紧 |
 
-响应：`requests` / `ttft_p50_ms` / `ttft_p95_ms` / `latency_p50_ms` / `latency_p95_ms` / `abstain_rate` / `degraded_rate` / `error_rate` / `avg_cost_cny` / `total_cost_cny` / `avg_completion_tokens` / `by_endpoint`（按端点计数）/ `index`（文档与块数）。
+响应：`requests` / `ttft_p50_ms` / `ttft_p95_ms` / `latency_p50_ms` / `latency_p95_ms` / `abstain_rate` / `degraded_rate` / `error_rate` / `avg_cost_cny` / `total_cost_cny` / `avg_completion_tokens` / `by_endpoint`（按端点计数）/ `stages`（分阶段耗时）/ `abstain_sources`（拒答来源计数）/ `index`（文档与块数）。
+
+`stages` 的键是 `query_understanding_ms` / `retrieve_ms` / `rerank_ms` / `generate_ms` / `verify_ms` / `total_ms`，每项给 `p50` / `p95` / `count`。数据来自 `query_log.timings_json`（每次请求落库），所以「整卡 P50 里检索占多少」可复现，不是事后估算。`abstain_sources` 形如 `{"gate": 3, "generator": 1, "none": 20}`：`gate` 是没调 LLM 就拒了，`generator` 是调了但证据/引用不过——混在一起会把「阈值太严」误读成「模型不会答」。
 
 百分位用**最近秩法，不插值**：窗口内取排序后第 `⌈p×n⌉` 个值，样本少时不要按正态分布解读。`ttft_p50_ms` 为 `null` 表示窗口内全是拒答请求（没进 LLM，没有首字）。
 
@@ -431,13 +435,15 @@ curl 'http://127.0.0.1:8000/v1/sources/c_c97fd0c9d2'
 
 ### 8.1 基线对比（占位，D7 填满后这张表就是核心资产）
 
-| 变体 | Top-1 | Top-3 | recall@20 | 引用命中 | 误拒率 | 首字 P50 (ms) | 整卡 P50 (ms) | 整卡 P95 (ms) | 成本/次 |
-|---|---|---|---|---|---|---|---|---|---|
-| BM25 only | | | | | | | | | |
-| 向量 only | | | | | | | | | |
-| 混合 + RRF | | | | | | | | | |
-| + Rerank | | | | | | | | | |
-| + Query 理解（full） | | | | | | | | | |
+| 变体 | Top-1 | Top-3 | recall@20 | 引用命中 | 误拒率 | 拒答准确率 | 首字 P50 (ms) | 整卡 P50 (ms) | 整卡 P95 (ms) | 成本/次 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| BM25 only | | | | | | | | | | |
+| 向量 only | | | | | | | | | | |
+| 混合 + RRF | | | | | | | | | | |
+| + Rerank | | | | | | | | | | |
+| + Query 理解（full） | | | | | | | | | | |
+
+**为什么误拒率和拒答准确率必须并排**：只报拒答准确率，把 `ABSTAIN_THRESHOLD` 调到 0.9 就能刷到 100%——正样本全被误杀，指标却更好看。两个数一起看才知道阈值是不是在「该拒的拒了、不该拒的没拒」。列顺序与 `eval/scoring.py` 的 `TABLE_HEADER` 逐字一致（11 列）。
 
 ---
 
@@ -449,10 +455,13 @@ curl 'http://127.0.0.1:8000/v1/sources/c_c97fd0c9d2'
 4. **重排阈值需实测标定**：`bge-reranker-v2-m3` 输出区间 0-1，无关内容压到 0.0000、真相关仅 0.5587，`ABSTAIN_THRESHOLD=0.35` 只是初值，D7 按真实语料画 ROC 再定。
 5. **`index.jsonl` 有 7 行历史重复**（k8s 1 / nginx 3 / mysql 3，续抓累积）：114/42/47 行 vs 113/39/44 个 `.md`；索引器只扫 `.md`，不受影响，新的 `--force` 已按 slug 覆盖写，不会再累积。
 6. **没有鉴权**：接口对本地开放，网络暴露前必须加 token。
-7. **LLM 生成失败降级**：JSON 解析失败或 `finish_reason=length` 重试 1 次（长度截断时追加"更短"指令），再失败降级为纯文本片段（`degraded=true`），此时没有结构化字段。重试会让整卡翻倍，是尾延迟的主要来源。
+7. **LLM 生成失败降级**：JSON 解析失败或 `finish_reason=length` 重试 1 次（长度截断时追加"更短"指令），再失败降级为纯文本片段（`degraded=true`），此时没有结构化字段。重试会让整卡翻倍，是尾延迟的主要来源。**引用两次都不过**的收尾是 `abstained=true` + `degraded=true` + `abort_reason=citations_invalid`（ADR-5② 要求拒答，同时留标记把它与「检索不到」分开统计）。
 8. **`embed_cache.jsonl` 是明文 JSONL**（47 MB / 2081 条，浮点全精度）：换 float32 二进制能压到 1/4，但重跑索引省下的 API 调用远比磁盘值钱，暂不做。
 9. **nginx 语料只有官方模块参考页**：没有 502/504 排障专页，nginx 类问题 Top-1 常落在 `ngx_http_upstream_module` 的参数说明上——召回对、根因浅，D7 评测时要单独看 nginx 子集。
 10. **Redis 语料有版本变体近似重复**（`operate-rs-7.22-*` / `7.8-*` / `7.4-*` 同一篇按版本重复收录）：`doc_hash` 精确去重识别不了，会抬升同质块竞争，D7 前按 URL 去版本段或模糊去重。
+11. **流式与同步两条编排没有合并**（D6 代码审核记录，已留在代码注释里）：`app/core/streaming.py` 与 `app/core/pipeline.py` 各写了一遍「闸门一 → 生成 → 引用校验 → 降级」，靠三处 `model_copy` 对齐口径；正解是抽 `core/orchestrate.py`，让流式只负责转帧。D6 只做审核与修复，重构要配回归，留到 D8。
+12. **测试 fixture 有两套同名副本**：`tests/test_api_ask.py` 与 `tests/test_streaming.py` 各自定义 `make_settings` / `make_chunk` / `FakeRetriever`，改 `ScoredChunk` 字段要改四处；应上移 `conftest.py`，同理留到 D8。
+13. **`eval/scoring.py` 反向 import `app.obs.stats`**（只为共用 `percentile`）：app 不 import eval，无循环，但评测层并不完全独立；要把 stats.py 挪到公共包才能彻底解耦。
 
 ---
 
@@ -462,12 +471,12 @@ curl 'http://127.0.0.1:8000/v1/sources/c_c97fd0c9d2'
 oncall-copilot/
 ├── app/
 │   ├── api/          # ask / diagnose / webhook / sources / admin
-│   ├── core/         # query_understanding / retriever / reranker / generator / guard / schemas
+│   ├── core/         # query_understanding / retriever / reranker / generator / guard / streaming / pipeline / prompts / schemas
 │   ├── index/        # chunker / embedder / vector_store / bm25_store / indexer
-│   └── obs/          # db / logging
+│   └── obs/          # db / logging / stats（percentile 的单一实现）
 ├── content/          # 255 篇抓取的 Markdown（gitignore）
 ├── data/             # lancedb / bm25.pkl / oncall.db / embed_cache.jsonl（gitignore）
-├── eval/             # dataset.jsonl / run_eval.py / report.md + 探针样本 probe_*.jsonl
+├── eval/             # dataset.jsonl（50 条）/ scoring.py（评测契约）/ run_eval.py / 探针样本 probe_*.jsonl
 ├── scripts/          # fetch_corpus.py / smoke_api.py / eval_retrieval_probe.py / bench_stream.py / d5_probe.py / audit_corpus.py / simulate_alert.py / demo.py
 ├── tests/
 ├── .env.example
@@ -486,7 +495,7 @@ oncall-copilot/
 | D3 | Query 理解 + 双路召回 + RRF | ✅ 完成（50 条探针：规则 1.000 / need_llm 2%；recall@20 1.000；35 个单测） |
 | D4 | 重排 + 生成 + 引用校验 / 拒答 | ✅ 完成（142 个单测；端到端 36 次真实调用：P50 约 4.2 s、P95 8003 ms、最慢 8306 ms、¥0.0069/次；P50 达标、P95 贴线未过，见 §5.3 与 §9 第 3 条） |
 | D5 | API 全量（SSE / webhook / admin）+ 日志 | ✅ 完成（7 接口 + SSE 帧序 + query_log + metrics；9 次流式实测：首字 P50 1177 ms、整卡 P50 2324 ms、¥0.0043/次；171 个单测） |
-| D6 | 评测集 + 评测脚本 | 未开工 |
+| D6 | 评测集 + 评测脚本 | ✅ 完成（50 条：40 正 + 10 负，47 个 gold url 逐条核对命中语料；五档变体 + LLM judge 缓存；11 列基线表） |
 | D7 | 5 变体基线 + 调参（唯一止损点） | 未开工 |
 | D8 | 降级路径测试 + pytest | 未开工 |
 | D9-D10 | 演示脚本 + 录屏 + README 定稿 | 未开工 |

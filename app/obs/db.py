@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -75,6 +76,8 @@ CREATE TABLE IF NOT EXISTS query_log (
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     cost_cny          REAL NOT NULL DEFAULT 0,
+    timings_json      TEXT,
+    abstained_at      TEXT,
     created_at        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_query_log_created ON query_log(created_at);
@@ -103,8 +106,17 @@ class DB:
             conn.close()
 
     def init_schema(self) -> None:
+        """建表 + 轻量迁移。
+
+        老库（D5 时期建的）没有 timings_json / abstained_at 两列，CREATE TABLE IF NOT
+        EXISTS 不会补列，所以这里显式 ALTER 一次——生产升级路径就是这一句。
+        """
         with self._conn() as c:
             c.executescript(SCHEMA)
+            have = {r["name"] for r in c.execute("PRAGMA table_info(query_log)")}
+            for column, decl in (("timings_json", "TEXT"), ("abstained_at", "TEXT")):
+                if column not in have:
+                    c.execute(f"ALTER TABLE query_log ADD COLUMN {column} {decl}")
 
     # -- documents ---------------------------------------------
     def doc_rows(self, *, include_deleted: bool = False) -> dict[str, dict]:
@@ -226,6 +238,8 @@ class DB:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         cost_cny: float = 0.0,
+        timings_json: str = "",
+        abstained_at: str | None = None,
     ) -> int:
         """落一行请求日志。
 
@@ -238,8 +252,9 @@ class DB:
                 """
                 INSERT INTO query_log (request_id, endpoint, query, plan_json, hit_chunk_ids,
                     context_chunk_ids, answer_len, abstained, degraded, status, ttft_ms,
-                    latency_ms, prompt_tokens, completion_tokens, cost_cny, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    latency_ms, prompt_tokens, completion_tokens, cost_cny, timings_json,
+                    abstained_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -257,6 +272,8 @@ class DB:
                     int(prompt_tokens or 0),
                     int(completion_tokens or 0),
                     float(cost_cny or 0.0),
+                    timings_json or "",
+                    abstained_at,
                     utc_now(),
                 ),
             )
@@ -285,6 +302,32 @@ class DB:
         for r in rows:
             key = str(r.get("endpoint") or "?")
             endpoints[key] = endpoints.get(key, 0) + 1
+        stages: dict[str, dict[str, float | int]] = {}
+        stage_vals: dict[str, list[float]] = {}
+        for r in rows:
+            raw = r.get("timings_json") or ""
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):  # 手工塞进来的脏行，跳过而不是让整个接口 500
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            for key, value in parsed.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    stage_vals.setdefault(str(key), []).append(float(value))
+        for key, values in stage_vals.items():
+            stages[key] = {
+                "p50": percentile(values, 50),
+                "p95": percentile(values, 95),
+                "count": len(values),
+            }
+        abstain_sources = {"gate": 0, "generator": 0, "none": 0}
+        for r in rows:
+            abstain_sources[str(r.get("abstained_at") or "none")] = (
+                abstain_sources.get(str(r.get("abstained_at") or "none"), 0) + 1
+            )
         abstained = sum(1 for r in rows if r.get("abstained"))
         degraded = sum(1 for r in rows if r.get("degraded"))
         errors = sum(1 for r in rows if str(r.get("status") or "ok") != "ok")
@@ -302,5 +345,7 @@ class DB:
             "total_cost_cny": round(sum(costs), 6),
             "avg_completion_tokens": round(sum(comps) / total, 1) if total else 0.0,
             "by_endpoint": endpoints,
+            "stages": stages,
+            "abstain_sources": abstain_sources,
         }
 
