@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from app.obs.stats import percentile
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     doc_id      TEXT PRIMARY KEY,
@@ -289,10 +291,10 @@ class DB:
         return {
             "window": int(window),
             "requests": total,
-            "ttft_p50_ms": _percentile(ttft, 50),
-            "ttft_p95_ms": _percentile(ttft, 95),
-            "latency_p50_ms": _percentile(lat, 50),
-            "latency_p95_ms": _percentile(lat, 95),
+            "ttft_p50_ms": percentile(ttft, 50),
+            "ttft_p95_ms": percentile(ttft, 95),
+            "latency_p50_ms": percentile(lat, 50),
+            "latency_p95_ms": percentile(lat, 95),
             "abstain_rate": round(abstained / total, 4) if total else 0.0,
             "degraded_rate": round(degraded / total, 4) if total else 0.0,
             "error_rate": round(errors / total, 4) if total else 0.0,
@@ -302,15 +304,3 @@ class DB:
             "by_endpoint": endpoints,
         }
 
-
-def _percentile(values: list[float], q: float) -> float | None:
-    """最近秩百分位：样本为空返回 None，否则返回真实存在的某个值。"""
-    if not values:
-        return None
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return round(ordered[0], 1)
-    import math
-
-    idx = max(0, min(len(ordered) - 1, math.ceil(q / 100.0 * len(ordered)) - 1))
-    return round(ordered[idx], 1)

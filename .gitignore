@@ -13,6 +13,9 @@ jieba.cache
 # 密钥
 .env
 
+# 文档（讲解手册 / 流程图 / 参考链接，本机留存，不进 git）
+docs/
+
 # 临时
 *.log
 .downloads/
