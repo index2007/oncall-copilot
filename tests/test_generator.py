@@ -365,17 +365,19 @@ def test_write_commands_rejected(command):
 # ------------------------------------------------ 输出预算：模型不听话时的兜底
 
 
-def test_causes_capped_to_two(monkeypatch, chunks, settings):
+def test_causes_capped_to_three(monkeypatch, chunks, settings):
+    """上限是 3 条：Top-3 要判 causes[0..2]，只截到 2 条时这一列没有信息量。"""
     payload = _good_payload()
     payload["causes"] = [
         {"title": "原因一", "confidence": 0.9, "explanation": "依据一", "evidence": [{"chunk_id": "k8s-oom-001"}]},
         {"title": "原因二", "confidence": 0.7, "explanation": "依据二", "evidence": [{"chunk_id": "k8s-oom-002"}]},
         {"title": "原因三", "confidence": 0.6, "explanation": "依据三", "evidence": [{"chunk_id": "k8s-oom-003"}]},
+        {"title": "原因四", "confidence": 0.5, "explanation": "依据四", "evidence": [{"chunk_id": "k8s-oom-001"}]},
     ]
     _install(monkeypatch, FakeLLM(json.dumps(payload, ensure_ascii=False)))
     card = generator.generate(QUERY, chunks, settings=settings)
 
-    assert [c.title for c in card.causes] == ["原因一", "原因二"]
+    assert [c.title for c in card.causes] == ["原因一", "原因二", "原因三"]
 
 
 def test_evidence_capped_per_cause(monkeypatch, chunks, settings):

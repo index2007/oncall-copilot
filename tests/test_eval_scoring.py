@@ -9,6 +9,7 @@ run_eval.py 里要真索引、真模型的部分（Harness / JudgeRunner 的网�
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -228,10 +229,12 @@ def test_summarize_counts_false_abstain_and_negative_accuracy() -> None:
     assert m.positives == 1 and m.negatives == 2
     assert m.false_abstain == 1.0
     assert m.abstain_accuracy == 0.5
-    # 拒答的样本不进 Top-1/引用/recall 分子，但仍在分母里
+    # 拒答的样本不进 Top-1/引用的分子；但召回发生在生成之前，recall@20 必须照算
     assert m.top1 == 0.0
+    assert m.recall20_pool == 1.0
     assert m.recall20 == 0.0
     assert m.citation_hit == 0.0
+    assert m.citation_hit_answered == 0.0  # 分母 0 条作答样本，不给假分数
     assert m.errors == 0
 
 
@@ -325,3 +328,33 @@ def test_apply_judge_only_pays_for_keyword_misses() -> None:
     assert m.errors == 1
     assert judge.calls == ["容器内存超过 limit 被内核杀掉"]
     assert m.judge_used == 1
+
+
+def test_dump_results_writes_rerank_top1_jsonl(tmp_path) -> None:
+    """阈值标定吃的是逐条 rerank_top1，不是聚合表；这里钉住落盘字段与行序。"""
+    import run_eval  # 只测纯落盘：_dump_results 不碰网络、不建索引
+
+    rows = [make_row("e001"), make_negative("n001")]
+    pos = scoring.EvalResult(
+        row_id="e001", variant="full", abstained=False, causes=("Pod 被 OOMKilled",),
+        citations=(GOLD,), recall_urls=(GOLD,), rerank_top1=0.5587,
+        ttft_ms=900.0, latency_ms=2400.0, cost_cny=0.004,
+    )
+    neg = scoring.EvalResult(
+        row_id="n001", variant="full", abstained=True, rerank_top1=0.0002, latency_ms=300.0,
+    )
+    run = run_eval.VariantRun(
+        variant="full",
+        results=[pos, neg],
+        metrics=scoring.summarize([pos, neg], rows, variant="full"),
+    )
+
+    out = tmp_path / "nested" / "results.jsonl"
+    run_eval._dump_results(out, [run], rows)
+
+    lines = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
+    assert [x["row_id"] for x in lines] == ["e001", "n001"]
+    assert lines[0]["rerank_top1"] == 0.5587
+    assert lines[1]["negative"] is True and lines[1]["abstained"] is True
+    assert lines[0]["citations"] == [GOLD]
+    assert {"variant", "ttft_ms", "cost_cny", "causes", "recall_urls"} <= set(lines[0])

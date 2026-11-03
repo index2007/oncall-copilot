@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-11-03 13:26:34",
+  "dataset": "C:\\Users\\chuan\\Documents\\deepseek-harness\\default-workspace\\oncall-copilot\\eval\\dataset.jsonl",
+  "rows": 50,
+  "positives": 40,
+  "negatives": 10,
+  "limit": null,
+  "stream": true,
+  "judge": "llm",
+  "model": "deepseek-flash",
+  "thinking": "disabled",
+  "variants": [
+    {
+      "variant": "full",
+      "positives": 40,
+      "negatives": 10,
+      "top1": 0.8,
+      "top3": 0.825,
+      "recall20": 0.8,
+      "recall20_pool": 0.975,
+      "citation_hit": 0.7,
+      "citation_hit_answered": 0.8484848484848485,
+      "false_abstain": 0.175,
+      "abstain_accuracy": 0.9,
+      "ttft_p50_ms": 1096.3,
+      "latency_p50_ms": 2626.2,
+      "latency_p95_ms": 3784.4,
+      "cost_avg_cny": 0.005053,
+      "errors": 0,
+      "judge_used": 16
+    }
+  ],
+  "cost_cny": {
+    "generation": 0.252634,
+    "judge": 0.007142,
+    "total": 0.259776
+  },
+  "judge_calls": 18,
+  "judge_cache_hits": 16,
+  "errors": {
+    "full": 0
+  },
+  "elapsed_s": {
+    "full": 135.5
+  }
+}

@@ -63,9 +63,10 @@ MIN_CONTEXT_BUDGET = 800
 MAX_VERIFY_COMMANDS = 3
 
 # 输出预算的硬上限：prompt 里已经写了，这里再裁一遍。
-# 为什么两处都要有：prompt 是请求不是保证，实测模型给 3 条 causes 时不会自己收，
+# 为什么两处都要有：prompt 是请求不是保证，实测模型在"最多 2 条"时照样吐 4 条，
 # 而每条多出来的 explanation 都是几十毫秒，整卡 ≤4s 的验收线扛不住。
-MAX_CAUSES = 2
+# 3 条而不是 2 条：Top-3 才有东西可判（D7 实测只给 1 条时 Top-3 恒等于 Top-1）。
+MAX_CAUSES = 3
 MAX_EVIDENCE_PER_CAUSE = 2
 MAX_ACTIONS = 3
 SUMMARY_MAX_CHARS = 80

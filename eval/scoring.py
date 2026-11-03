@@ -24,12 +24,16 @@ context_urls 是真正喂给 LLM 的 5 条 URL。三者不能混用，否则 rec
 == 指标口径（与设计清单 §6.2 一致）==
 - Top-1 根因命中：causes[0] 命中 gold（先关键词，未命中再 LLM-as-judge）
 - Top-3 根因命中：causes[0..2] 任一命中
-- recall@20：重排前 20 条候选 URL 含任一 gold_doc_urls
-- 引用命中率：卡片 citations 里至少一条 URL ∈ gold_doc_urls
+- recall@20：重排前 20 条候选 URL 含任一 gold_doc_urls；分母是全部正样本（含拒答），
+  因为召回发生在生成之前
+- 引用命中率：卡片 citations 里至少一条 URL ∈ gold_doc_urls；分母是作答样本数
+  （拒答的卡没有 citations 可核验，计入分母等于重复惩罚同一次拒答）
 - 拒答准确率：负样本正确拒答的比例
 - 误拒率：正样本被错误拒答的比例（必须和拒答率一起看，否则调高阈值就能刷分）
 - 首 token / 整卡 / 成本：TTFT 取 P50，整卡取 P50 与 P95，成本取均值
-正样本只算 Top-1/Top-3/recall@20/引用命中/误拒率；负样本只算拒答准确率。
+正样本算 Top-1/Top-3/recall@20/引用命中/误拒率；负样本只算拒答准确率。
+指标表里的 recall@20 / 引用命中 各自的分母见上（表里是对齐后的那两列；
+条件版 recall20 与全样本版 citation_hit 仍写进 JSON，便于排查）。
 error 非空（网络失败、超时、解析失败）的样本不进任何分母，单独计入 errors，
 否则一次网络抖动会被记成"答错"。
 """
@@ -213,6 +217,8 @@ class EvalResult:
     citations: tuple[str, ...] = ()
     recall_urls: tuple[str, ...] = ()
     context_urls: tuple[str, ...] = ()
+    #: 重排后 Top-1 的原始分（0-1）；无重排档或重排降级时为 None，用于阈值标定
+    rerank_top1: float | None = None
     ttft_ms: float | None = None
     latency_ms: float = 0.0
     cost_cny: float = 0.0
@@ -235,7 +241,11 @@ class VariantMetrics:
     top1: float = 0.0
     top3: float = 0.0
     recall20: float = 0.0
+    # 只看召回池、与是否拒答无关的同一指标：分母是全部可用正样本。
+    # 两者并列是刻意的——只报条件版会让"模型拒答"伪装成"召回失败"（D7 实测差 30 个点）。
+    recall20_pool: float = 0.0
     citation_hit: float = 0.0
+    citation_hit_answered: float = 0.0
     false_abstain: float = 0.0
     abstain_accuracy: float = 0.0
     ttft_p50_ms: float | None = None
@@ -259,8 +269,8 @@ class VariantMetrics:
             self.label,
             _pct(self.top1),
             _pct(self.top3),
-            _pct(self.recall20),
-            _pct(self.citation_hit),
+            _pct(self.recall20_pool),
+            _pct(self.citation_hit_answered),
             _pct(self.false_abstain),
             _pct(self.abstain_accuracy),
             _num(self.ttft_p50_ms),
@@ -278,7 +288,9 @@ class VariantMetrics:
             "top1": self.top1,
             "top3": self.top3,
             "recall20": self.recall20,
+            "recall20_pool": self.recall20_pool,
             "citation_hit": self.citation_hit,
+            "citation_hit_answered": self.citation_hit_answered,
             "false_abstain": self.false_abstain,
             "abstain_accuracy": self.abstain_accuracy,
             "ttft_p50_ms": self.ttft_p50_ms,
@@ -338,14 +350,19 @@ def summarize(
     metrics.positives = len(pos_ok)
     metrics.negatives = len(neg_ok)
 
-    top1 = top3 = cite = recall = 0
+    top1 = top3 = cite = recall = recall_pool = cited_answered = 0
     false_abstain = 0
     for row, res in pos_ok:
+        # 召回发生在生成之前：拒答的样本同样有 recall_urls，必须计入召回分母，
+        # 否则"模型不敢答"会被算成"召回没找到"，两件事就分不开了。
+        if recall_hit(res.recall_urls, row):
+            recall_pool += 1
         if res.abstained:
             false_abstain += 1
             continue  # 拒答的样本没有 causes，不能算"答案错"两次
         if recall_hit(res.recall_urls, row):
             recall += 1
+        cited_answered += 1
         if citation_hit(res.citations, row):
             cite += 1
         hit1, hit3, judged = root_cause_hit(res.causes, row)
@@ -359,8 +376,11 @@ def summarize(
 
     metrics.top1 = _ratio(top1, len(pos_ok))
     metrics.top3 = _ratio(top3, len(pos_ok))
+    metrics.recall20_pool = _ratio(recall_pool, len(pos_ok))
     metrics.recall20 = _ratio(recall, len(pos_ok))
     metrics.citation_hit = _ratio(cite, len(pos_ok))
+    # 引用只能核验答出来的卡：拒答样本没有 citations，计入分母等于重复惩罚。
+    metrics.citation_hit_answered = _ratio(cite, cited_answered)
     metrics.false_abstain = _ratio(false_abstain, len(pos_ok))
     metrics.abstain_accuracy = _ratio(correct_abstain, len(neg_ok))
     metrics.ttft_p50_ms = percentile(ttfts, 50)

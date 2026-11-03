@@ -365,6 +365,7 @@ class Harness:
         """
         t0 = time.perf_counter()
         recall_urls: tuple[str, ...] = ()
+        rerank_top1: float | None = None
         cost = 0.0
         try:
             plan = self.plan_for(row, variant)
@@ -378,6 +379,10 @@ class Harness:
             else:
                 context = list(candidates[: int(self.settings.top_k_final or 5)])
                 degraded = False
+            # 阈值标定要的是重排原始分（不是 RRF 量级），降级时为 None
+            rerank_top1 = (
+                context[0].rerank_score if (need_rerank and context) else None
+            )
 
             # 闸门一：与 pipeline 一致，只在有重排分、且重排没降级时套阈值
             if need_rerank and not degraded and guard.should_abstain(
@@ -388,7 +393,7 @@ class Harness:
                         row_id=row.id,
                         variant=variant,
                         abstained=True,
-                        recall_urls=recall_urls,
+                        recall_urls=recall_urls, rerank_top1=rerank_top1,
                         latency_ms=round((time.perf_counter() - t0) * 1000, 1),
                         cost_cny=round(cost, 6),
                     ),
@@ -406,7 +411,7 @@ class Harness:
                 abstained=bool(card.abstained),
                 causes=tuple(_cause_text(c) for c in card.causes),
                 citations=tuple(c.url for c in card.citations if c.url),
-                recall_urls=recall_urls,
+                recall_urls=recall_urls, rerank_top1=rerank_top1,
                 context_urls=tuple(c.url for c in fed if c.url),
                 ttft_ms=ttft,
                 latency_ms=round((time.perf_counter() - t0) * 1000, 1),
@@ -420,7 +425,7 @@ class Harness:
                     row_id=row.id,
                     variant=variant,
                     abstained=False,
-                    recall_urls=recall_urls,
+                    recall_urls=recall_urls, rerank_top1=rerank_top1,
                     latency_ms=round((time.perf_counter() - t0) * 1000, 1),
                     cost_cny=round(cost, 6),
                     error="{}: {}".format(type(exc).__name__, exc)[:500],
@@ -595,6 +600,10 @@ def render_report(
         "",
         "> Top-1/Top-3 由 {} 判定；失败明细仍按关键词判定，两者可能有个别样本不一致。".format(
             "LLM-as-judge（关键词先判，漏判才调模型）" if judge.enabled else "关键词"),
+        ">",
+        "> 列口径：**recall@20 只看召回池、分母是全部正样本**（生成之前的事，拒答不该拖累它）；"
+        "**引用命中只看答出来的卡、分母是作答样本数**（拒答的卡没有 citations 可核验）。"
+        "两者都把拒答样本的处置交给误拒率一列。",
         "",
         "## 失败明细（Top-1 未命中或引用未命中）",
         "",
@@ -644,6 +653,32 @@ def render_report(
             "所以 full 成本略低估；严格对齐请设 QUERY_LLM_ENABLED=0 再跑。",
         ]
     return "\n".join(head + body + tail) + "\n"
+
+
+def _dump_results(
+    path: Path, runs: Sequence[VariantRun], rows: Sequence[scoring.EvalRow]
+) -> None:
+    """逐条落盘：阈值标定与失败归因都吃这份明细，报告只放聚合。"""
+    by_id = {r.id: r for r in rows}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for run in runs:
+            for res in run.results:
+                row = by_id[res.row_id]
+                fh.write(json.dumps({
+                    "variant": res.variant,
+                    "row_id": res.row_id,
+                    "negative": row.negative,
+                    "abstained": res.abstained,
+                    "error": res.error,
+                    "rerank_top1": res.rerank_top1,
+                    "ttft_ms": res.ttft_ms,
+                    "latency_ms": res.latency_ms,
+                    "cost_cny": res.cost_cny,
+                    "causes": list(res.causes),
+                    "citations": list(res.citations),
+                    "recall_urls": list(res.recall_urls),
+                }, ensure_ascii=False) + "\n")
 
 
 def _json_summary(
@@ -701,6 +736,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out", default=str(_EVAL_DIR / DEFAULT_OUT),
         help="Markdown 报告路径（默认 eval/report.md）",
+    )
+    parser.add_argument(
+        "--dump-results", default=None, metavar="PATH",
+        help="逐条结果写成 JSONL（含 rerank_top1 原始分），用于阈值标定，不影响报告",
     )
     parser.add_argument(
         "--stream", action="store_true",
@@ -829,6 +868,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         print("报告写入失败：{}".format(exc), file=sys.stderr)
         rc = rc or 1
+
+    if args.dump_results:
+        try:
+            _dump_results(Path(args.dump_results), runs, rows)
+            print("逐条结果已写入：{}".format(args.dump_results), file=console)
+        except OSError as exc:
+            print("逐条结果写入失败：{}".format(exc), file=sys.stderr)
+            rc = rc or 1
 
     if args.json:
         print(json.dumps(
