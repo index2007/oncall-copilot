@@ -59,7 +59,12 @@ class Settings(BaseSettings):
     top_k_vec: int = 20
     top_k_bm25: int = 20
     top_k_fuse: int = 20  # 融合后交给重排的条数（M5 -> M6）
-    top_k_final: int = 5
+    # 重排后真正进上下文的条数。D7 全量 50 条评测实测：Top5 只有 34/40 正样本的
+    # gold 文档进入上下文（85.0%）；纯重排重放证明 Top8 + 每文档最多 2 块能到
+    # 39/40（97.5%，唯一漏的 e018 是 gold 文档不在召回池内，属召回问题，不是选块问题）。
+    # 原方案「Top5 + 每文档≤2」收益为 0：腾出的 1-2 个名额只到重排第 6-7 名，
+    # 而缺失的 gold 文档排在第 6/7/9/10 名，够不着。
+    top_k_final: int = 8
     rrf_k: int = 60
     abstain_threshold: float = 0.35
     sub_index_filter: bool = True  # Query 理解命中子库时是否加元数据过滤

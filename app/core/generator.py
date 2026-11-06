@@ -10,7 +10,7 @@
    不抛异常）。这是 ADR-4 的最后一档，API 层拿到卡就能直接用。
 
 几条刻意的取舍：
-- 上下文有预算（PROMPT_CHAR_BUDGET=6000 字符）且每块都必须带 id：把 20 条召回
+- 上下文有预算（PROMPT_CHAR_BUDGET=3600 字符）且每块都必须带 id：把 20 条召回
   全塞进去的结果是模型在一堆无关段落里挑，既贵又不准；宁可按水位分配、
   给每块留可读的正文，也不让某一块独占预算。
 - 引用过滤是"事后校验"而不是"信任模型"：citations / evidence 里凡是候选块
@@ -49,13 +49,22 @@ from app.config import Settings, get_settings
 from app.core import prompts
 from app.core.schemas import Cause, Citation, DiagnosisCard, Evidence, ScoredChunk
 
-# 上下文预算：system prompt 约 1.7k 字符，加正文控制在 2600 字符内，
-# 折合约 1.3k prompt tokens。实测 2357 prompt + 972 completion tokens 要 6.5s
+# 上下文预算：system prompt 约 1.7k 字符，加正文控制在 3600 字符内，
+# 折合约 1.8k prompt tokens。实测 2357 prompt + 972 completion tokens 要 6.5s
 # （≈130 token/s，清单 §6.5），所以预算与输出上限一起收紧，目标整卡 ≤4s。
-PROMPT_CHAR_BUDGET = 2600
-# 一次最多喂 5 块（重排本身就是 Top5）：再多只会把每块正文挤成半句话，
-# 而 prompt token 数几乎线性地换成延迟
-MAX_CONTEXT_CHUNKS = 5
+# 为什么从 2600 提到 3600：D7 全量 50 条评测里，重排 Top5 只有 34/40 正样本的
+# gold 文档进入上下文（85.0%）；纯重排重放证明「Top8 + 每文档最多 2 块」能到
+# 39/40（97.5%，唯一漏的 e018 是 gold 文档不在召回池内，属召回问题）。
+# 单块变短多少（按 1500 字符的块实测 water_fill）：原来 5 块 / 2600 预算每块
+# 495 字符，现在 8 块 / 3600 每块 433 字符，-12%——与 520→450 的粗算同量级，
+# 不是"挤成半句话"（MIN_TEXT_CHARS=40 的 10 倍），块本身短于 433 字符时根本不截断。
+PROMPT_CHAR_BUDGET = 3600
+# 一次最多喂 8 块（重排取 Top8）：Top5 时同一篇文档常占掉 2-3 个名额，缺失的
+# gold 文档排在重排第 6/7/9/10 名，够不着——所以先把候选扩到 8，再用下面的
+# 每文档 ≤2 块配额把名额分给更多篇文档。8 块 / 3600 字符 ≈ 450 字符/块
+# （实测 433），原 5 块 / 2600 ≈ 520（实测 495）：同量级、单块短约 12%，
+# 但 prompt token 数只多约 0.5k，换的是 gold 文档进上下文的比例 85.0% -> 97.5%。
+MAX_CONTEXT_CHUNKS = 8
 # 每块正文的下限；低于这个数就少给几块，而不是给一堆"半句话"
 MIN_TEXT_CHARS = 40
 # 上下文再挤也要留出的最小预算（query 很长时防止把正文挤没）
@@ -323,18 +332,48 @@ def _truncate(text: str, limit: int) -> str:
     return text[: limit - 1] + "…"
 
 
-def _select_chunks(chunks: Sequence[ScoredChunk], max_chunks: int) -> list[ScoredChunk]:
-    """按传入顺序（重排后的名次）取块，去重、去空 id。"""
+def _select_chunks(
+    chunks: Sequence[ScoredChunk],
+    max_chunks: int,
+    max_per_doc: int = 2,
+) -> list[ScoredChunk]:
+    """按传入顺序（重排后的名次）取块：去空 id、去重复 chunk_id，同一 url 最多 max_per_doc 块。
+
+    为什么要每文档配额：Top5 时同一篇长文档经常一口气占掉 2-3 个名额，把排在
+    第 6-10 名的 gold 文档挤出去。D7 全量 50 条实测，重排 Top5 只有 34/40 正样本
+    的 gold 文档进入上下文（85.0%）；纯重排重放证明 Top8 + 每文档 ≤2 块能到
+    39/40（97.5%，唯一漏的 e018 是 gold 文档不在召回池内，属召回问题）。
+
+    为什么要回填：配额只在"还有别的文档可补"时才划算。全池只有 1-2 篇文档的
+    查询（评测里的 e036 全池只有 2 篇文档）如果死守配额，等于白丢名额——所以
+    第一轮按配额选不满 max_chunks 时，把因配额跳过的块按原顺序补回来。
+
+    url 为空视为"没有文档归属"，不参与配额：把一堆空 url 的块当成同一篇，
+    会让只有空 url 的池子永远只剩 max_per_doc 块。
+    """
     selected: list[ScoredChunk] = []
+    overflow: list[ScoredChunk] = []  # 因配额跳过、可能回填的块（此时已去过重）
     seen: set[str] = set()
+    per_doc: dict[str, int] = {}
+    quota = max_per_doc if max_per_doc and max_per_doc > 0 else None
     for chunk in chunks or []:
         cid = (getattr(chunk, "chunk_id", "") or "").strip()
         if not cid or cid in seen:
             continue
         seen.add(cid)
+        url = (getattr(chunk, "url", "") or "").strip()
+        if url and quota is not None and per_doc.get(url, 0) >= quota:
+            overflow.append(chunk)
+            continue
+        if url and quota is not None:
+            per_doc[url] = per_doc.get(url, 0) + 1
         selected.append(chunk)
         if len(selected) >= max_chunks:
+            return selected
+    for chunk in overflow:
+        if len(selected) >= max_chunks:
             break
+        selected.append(chunk)
     return selected
 
 
@@ -398,14 +437,18 @@ def build_context(
     *,
     budget: int = PROMPT_CHAR_BUDGET,
     max_chunks: int = MAX_CONTEXT_CHUNKS,
+    max_per_doc: int = 2,
 ) -> tuple[str, list[ScoredChunk]]:
     """候选块 -> (上下文文本, 实际用到的块)。总长 <= budget，每块都带 id。
 
     返回实际用到的块而不是全部：生成侧之后只允许引用这些块，调用方拿到的
     used 也就是"允许的引用集合"。预算连一块都放不下时返回空串——此时调用方
     应当走拒答，而不是把没有 id 的正文喂给模型。
+
+    max_per_doc 透传给 _select_chunks：同一篇文档最多进 max_per_doc 块，
+    选不满 max_chunks 时按重排名次回填。
     """
-    selected = _select_chunks(chunks, max_chunks)
+    selected = _select_chunks(chunks, max_chunks, max_per_doc)
     while selected:
         blocks = _layout(selected, budget)
         if blocks is not None:

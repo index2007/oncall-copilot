@@ -270,16 +270,61 @@ def test_context_budget_keeps_every_id():
     assert len(used) == text.count("[c-")
 
 
+def test_select_chunks_caps_blocks_per_document():
+    """同一 url 最多进 2 块，剩下的名额分给其他文档（D7：Top8 + 每文档≤2 到 39/40）。"""
+    same_doc = [_chunk("a-%d" % i, "同一篇文档的第 %d 段。" % i, url="https://example.com/a") for i in range(3)]
+    others = [
+        _chunk("b-%02d" % i, "其他文档的第 %d 段。" % i, url="https://example.com/b-%02d" % i)
+        for i in range(8)
+    ]
+    selected = generator._select_chunks(same_doc + others, generator.MAX_CONTEXT_CHUNKS)
+
+    assert len(selected) == generator.MAX_CONTEXT_CHUNKS == 8
+    assert sum(1 for c in selected if c.url == "https://example.com/a") == 2
+
+
+def test_select_chunks_backfills_when_pool_has_single_document():
+    """全池只有 1 篇文档的 8 块时配额回填，仍能选满 8 块（评测 e036 全池只有 2 篇文档）。"""
+    pool = [
+        _chunk("only-%02d" % i, "唯一文档的第 %d 段。" % i, url="https://example.com/only")
+        for i in range(8)
+    ]
+    selected = generator._select_chunks(pool, generator.MAX_CONTEXT_CHUNKS)
+
+    assert len(selected) == 8
+    assert [c.chunk_id for c in selected] == ["only-%02d" % i for i in range(8)]
+
+
+def test_build_context_fits_eight_chunks_under_new_budget():
+    """3600 字符预算下能真吃进 8 块：块数上限从 5 提到 8 后，默认路径确实用满了名额。"""
+    pool = [
+        _chunk(
+            "e-%02d" % i,
+            "第 %d 块正文。" % i + "排查步骤说明。" * 20,
+            heading="Pod 异常 > 排查",
+            url="https://example.com/p-%02d" % i,
+        )
+        for i in range(8)
+    ]
+    text, used = generator.build_context(pool)
+
+    assert len(used) == 8
+    assert len(text) <= generator.PROMPT_CHAR_BUDGET
+    for chunk in used:
+        assert "[" + chunk.chunk_id + "]" in text
+
+
 def test_user_message_within_budget(monkeypatch, settings):
     fake = _install(monkeypatch, FakeLLM(json.dumps({"abstained": True, "summary": "资料不足"}, ensure_ascii=False)))
     many = [_chunk("c-%02d" % i, "内存超限被 OOM killer 杀死，退出码 137。" * 60, heading="很长的标题" * 8) for i in range(12)]
     generator.generate(QUERY, many, settings=settings)
 
     user_message = fake.calls[0][1]["content"]
-    assert generator.PROMPT_CHAR_BUDGET == 2600
-    assert len(user_message) <= 2600
+    # 预算 3600 / 8 块：8 块每块约 450 字符，与原来 5 块 / 2600 字符同量级
+    assert generator.PROMPT_CHAR_BUDGET == 3600
+    assert len(user_message) <= 3600
     assert "[c-00]" in user_message
-    # 块数也受控：最多 5 块，剩下的预算留给正文而不是让标题把预算吃光
+    # 块数也受控：最多 8 块，剩下的预算留给正文而不是让标题把预算吃光
     assert user_message.count("[c-") <= generator.MAX_CONTEXT_CHUNKS
 
 
