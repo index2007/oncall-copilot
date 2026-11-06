@@ -152,6 +152,34 @@ def test_normal_card(monkeypatch, chunks, settings):
     assert prompts.SYSTEM_PROMPT in fake.calls[0][0]["content"]
     assert "[k8s-oom-001]" in fake.calls[0][1]["content"]
 
+def test_missing_citations_backfilled_from_evidence(monkeypatch, chunks, settings):
+    """模型给了合法 evidence 却漏写 citations：用 evidence 回填，不留"有结论、零出处"的卡。"""
+    payload = _good_payload()
+    payload["citations"] = []
+    _install(monkeypatch, FakeLLM(json.dumps(payload, ensure_ascii=False)))
+    card = generator.generate(QUERY, chunks, settings=settings)
+
+    assert card.abstained is False and card.degraded is False
+    assert [c.chunk_id for c in card.citations] == ["k8s-oom-001"]
+    # 回填的出处用块元数据补全，与模型自己写 citations 时同一套字段
+    assert card.citations[0].url == "https://example.com/a"
+    assert card.citations[0].title == "Pod 异常排查"
+    assert card.citations[0].heading_path == "Pod 异常 > OOMKilled"
+
+
+def test_backfilled_citations_dedup_across_causes(monkeypatch, chunks, settings):
+    """多条结论引用同一块时，回填出来的 citations 不能重复。"""
+    payload = _good_payload()
+    payload["citations"] = []
+    payload["causes"] = [
+        {"title": "内存超过 limit", "evidence": [{"chunk_id": "k8s-oom-001"}]},
+        {"title": "limit 设置过低", "evidence": [{"chunk_id": "k8s-oom-001"}, {"chunk_id": "k8s-oom-002"}]},
+    ]
+    _install(monkeypatch, FakeLLM(json.dumps(payload, ensure_ascii=False)))
+    card = generator.generate(QUERY, chunks, settings=settings)
+
+    assert [c.chunk_id for c in card.citations] == ["k8s-oom-001", "k8s-oom-002"]
+
 
 def test_retry_after_bad_json(monkeypatch, chunks, settings):
     fake = _install(

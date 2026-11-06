@@ -77,6 +77,8 @@ MAX_VERIFY_COMMANDS = 3
 # 3 条而不是 2 条：Top-3 才有东西可判（D7 实测只给 1 条时 Top-3 恒等于 Top-1）。
 MAX_CAUSES = 3
 MAX_EVIDENCE_PER_CAUSE = 2
+# citations 的硬上限：与 _fallback_citations 的默认值同源，免得两处各写一个 3
+MAX_CITATIONS = 3
 MAX_ACTIONS = 3
 SUMMARY_MAX_CHARS = 80
 EXPLANATION_MAX_CHARS = 50
@@ -668,7 +670,13 @@ def _normalize_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sanitize(card: DiagnosisCard, used: Sequence[ScoredChunk]) -> tuple[list[Cause], list[Citation], int]:
-    """后置校验：citations / evidence 只能引用 used 里的 chunk_id。"""
+    """后置校验：citations / evidence 只能引用 used 里的 chunk_id。
+
+    校验完补一刀：模型给了结论、evidence 也全指向真实块，却漏写 citations 时，
+    用这份已校验过的 evidence 回填出处（D7 实测 e040 就是"有结论、零出处"）。
+    这不是替模型挑块——块是它自己指的，只是把它漏列的引用补上；evidence 被丢光的
+    结论仍然整条不输出，所以回填不会救活没有依据的编造。
+    """
     by_id = {c.chunk_id.strip(): c for c in used if (c.chunk_id or "").strip()}
 
     citations: list[Citation] = []
@@ -709,6 +717,28 @@ def _sanitize(card: DiagnosisCard, used: Sequence[ScoredChunk]) -> tuple[list[Ca
             dropped += 1
             continue
         causes.append(cause.model_copy(update={"evidence": evidence}))
+
+    if causes and not citations:
+        filled: set[str] = set()
+        for cause in causes:
+            for item in cause.evidence:
+                cid = (item.chunk_id or "").strip()
+                chunk = by_id.get(cid)
+                if chunk is None or cid in filled:
+                    continue
+                filled.add(cid)
+                citations.append(
+                    Citation(
+                        chunk_id=cid,
+                        title=chunk.title,
+                        heading_path=chunk.heading_path,
+                        url=chunk.url,
+                    )
+                )
+                if len(citations) >= MAX_CITATIONS:
+                    break
+            if len(citations) >= MAX_CITATIONS:
+                break
     return causes, citations, dropped
 
 
@@ -738,7 +768,9 @@ def _preview_lines(used: Sequence[ScoredChunk], limit: int = 3, width: int = 120
     )
 
 
-def _fallback_citations(used: Sequence[ScoredChunk], limit: int = 3) -> list[Citation]:
+def _fallback_citations(
+    used: Sequence[ScoredChunk], limit: int = MAX_CITATIONS
+) -> list[Citation]:
     return [
         Citation(chunk_id=c.chunk_id.strip(), title=c.title, heading_path=c.heading_path, url=c.url)
         for c in used[:limit]
