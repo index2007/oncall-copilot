@@ -12,23 +12,23 @@
 逐条链路：plan -> 召回 ->（重排）->（闸门）-> 生成 -> 记 EvalResult。
 
 == 五档怎么接线（改之前先读，否则表不可比）==
-- bm25：只调 retriever.bm25_search，召回池 20 条，取前 5 条喂生成；不做向量、不做 RRF、
+- bm25：只调 retriever.bm25_search，召回池 20 条，取前 top_k_final(默认 8) 条喂生成；不做向量、不做 RRF、
   不做重排、不做 Query 理解。
 - vector：只调 retriever.vector_search，同上。
 - hybrid：retriever.retrieve(use_sub_index=False)：两路各 20 -> RRF -> 20 条候选，
-  取前 5 喂生成；不重排、不过滤子库。
-- hybrid_rerank：hybrid 的 20 条候选 -> reranker.rerank -> 5 条喂生成。
+  取前 top_k_final 条喂生成；不重排、不过滤子库。
+- hybrid_rerank：hybrid 的 20 条候选 -> reranker.rerank -> top_k_final 条喂生成。
 - full：query_understanding.analyze 得到 plan（子库过滤 + 查询扩展）->
-  retrieve(use_sub_index=True) -> rerank -> 5 条。
+  retrieve(use_sub_index=True) -> rerank -> top_k_final 条（选块再做每文档≤2 配额）。
 生成侧五档共用 app.core.generator（同一套 prompt、同一个模型），否则 Top-1 无从对比。
 
 == 口径与取舍（都是刻意的，不是没接完）==
 1. Retriever.retrieve() 内含子库过滤与"不足就补跑"的 fallback，表达不了"纯 BM25 / 纯向量"，
    所以这两档直接调底层 bm25_search / vector_search；hybrid 用 retrieve(use_sub_index=False)
-   才是真正的"两路各 20 + RRF"，而不是拿 full 的结果再截前 5。
+   才是真正的"两路各 20 + RRF"，而不是拿 full 的结果再截前 top_k_final 条。
 2. 非 full 变体不调 analyze()：用 QueryPlan(raw=symptom, clean=symptom)，search_text 就是
    原始报错文本。否则规则抽出的错误码/事件词会混进基线，"Query 理解"的增量被摊平。
-3. bm25/vector 的召回池同样取 20 条再截前 5：这样 recall@20 这一列五档同口径；只取 5 条的话
+3. bm25/vector 的召回池同样取 20 条再截前 top_k_final 条：这样 recall@20 这一列五档同口径；只取 5 条的话
    这一列对这档退化成 recall@5，和其他档没法比。
 4. 闸门 should_abstain 只在重排后套用（与 pipeline 一致，重排降级时跳过）。无重排的三档
    没有与 abstain_threshold(0.35) 同量纲的分数——BM25 无上界、余弦 0~1、RRF 约 1/60——
@@ -89,11 +89,11 @@ _TICK = chr(96)  # 反引号：源码里不埋转义，也方便在 Windows 上�
 
 # 每档"差在哪"的唯一说明来源：--dry-run 打印它，报告的口径段也用它。
 VARIANT_CHAINS: dict[str, str] = {
-    "bm25": "bm25_search(k=20) -> 前 5 条 -> generate（无向量、无 RRF、无重排、无 Query 理解）",
-    "vector": "vector_search(k=20) -> 前 5 条 -> generate（无 BM25、无 RRF、无重排、无 Query 理解）",
-    "hybrid": "retrieve(use_sub_index=False)：向量 20 + BM25 20 -> RRF -> 20 -> 前 5 条 -> generate",
-    "hybrid_rerank": "hybrid 的 20 条 -> rerank -> 5 -> generate（不做子库过滤）",
-    "full": "analyze（子库过滤 + 查询扩展）-> retrieve(use_sub_index=True) -> rerank -> 5 -> generate",
+    "bm25": "bm25_search(k=20) -> 前 top_k_final 条 -> generate（无向量、无 RRF、无重排、无 Query 理解）",
+    "vector": "vector_search(k=20) -> 前 top_k_final 条 -> generate（无 BM25、无 RRF、无重排、无 Query 理解）",
+    "hybrid": "retrieve(use_sub_index=False)：向量 20 + BM25 20 -> RRF -> 20 -> 前 top_k_final 条 -> generate",
+    "hybrid_rerank": "hybrid 的 20 条 -> rerank -> top_k_final -> generate（不做子库过滤）",
+    "full": "analyze（子库过滤 + 查询扩展）-> retrieve(use_sub_index=True) -> rerank -> top_k_final -> generate",
 }
 
 JUDGE_SYSTEM_PROMPT = (
@@ -111,7 +111,7 @@ USAGE_EXAMPLES = """示例：
   # 五档全跑 + 流式量 TTFT + 写报告
   .venv/Scripts/python.exe eval/run_eval.py --variant all --stream --out eval/report.md
 
-  # 省钱调试：前 5 条 + 关键词判定，不调 judge
+  # 省钱调试：前 5 条样本 + 关键词判定，不调 judge
   .venv/Scripts/python.exe eval/run_eval.py --variant all --limit 5 --judge keyword
 
   # 只看计划不花钱（不建索引、不调模型）
@@ -644,7 +644,7 @@ def render_report(
         "- 无重排的三档（bm25/vector/hybrid）没有与 abstain_threshold 同量纲的分数，"
         "不套检索侧闸门，只靠生成侧兜底：它们的误拒率天然偏低，负样本拒答准确率也偏低，"
         "对比 full 时要带上这条。",
-        "- bm25/vector 的召回池也是 20 条（只把前 5 条喂生成），否则 recall@20 对这两档退化成 recall@5。",
+        "- bm25/vector 的召回池也是 20 条（只把前 top_k_final 条喂生成），否则 recall@20 对这两档退化成 recall@top_k_final。",
         "- error 样本只计入 errors，不进 Top-1/recall/成本的分母（scoring.summarize 口径）。",
     ]
     if judge.enabled:
