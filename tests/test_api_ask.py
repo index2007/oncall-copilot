@@ -302,3 +302,22 @@ def test_query_log_failure_does_not_break_response():
     assert resp.status_code == 200
     assert resp.json()["card"]["summary"]
     assert any("query_log 写入失败" in text for text in records)
+
+def test_ask_stream_pump_crash_yields_internal_stage(monkeypatch):
+    """编排线程自己抛出（不是某一段的已知失败）→ error 帧 stage=internal。"""
+    db = FakeDB()
+    client = make_client(make_diagnoser(), db)
+
+    def boom(*args: Any, **kwargs: Any):
+        raise RuntimeError("编排线程崩了")
+
+    monkeypatch.setattr(ask_mod, "stream_diagnose", boom)
+
+    with client.stream("POST", "/v1/ask", json={"query": QUERY, "stream": True}) as resp:
+        assert resp.status_code == 200
+        frames = parse_sse(resp.iter_lines())
+
+    assert [event for event, _ in frames] == ["error"]
+    error = frames[0][1]
+    assert error["stage"] == "internal"
+    assert "RuntimeError" in error["message"]

@@ -20,7 +20,7 @@ import asyncio
 import json
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import APIRouter, Depends, Request
 from loguru import logger
@@ -146,14 +146,18 @@ def _sse_response(
                 pass
 
         def pump() -> None:
-            gen = stream_diagnose(
-                diagnoser,
-                req.query,
-                top_n=req.top_n,
-                allow_llm=req.allow_llm,
-                request_id=request_id,
-            )
+            gen: Iterator[Any] | None = None
             try:
+                # 创建也放进 try：正常时它只是个 generator 对象、不会执行，
+                # 但一旦哪天换掉实现或注入替身，在这里抛异常也必须落到 error 帧，
+                # 而不是让 sentinel 永远不 put、客户端挂在半开的 SSE 上（D8/S8）。
+                gen = stream_diagnose(
+                    diagnoser,
+                    req.query,
+                    top_n=req.top_n,
+                    allow_llm=req.allow_llm,
+                    request_id=request_id,
+                )
                 for item in gen:
                     if stop.is_set():  # 客户端已断开：下一个片段边界就收手
                         break
@@ -165,8 +169,9 @@ def _sse_response(
                     # stream_diagnose 里已经变成带准确 stage 的 error 帧（D8/F2）。
                     put(("error", {"stage": "internal", "message": type(exc).__name__ + ": " + str(exc)[:300]}))
             finally:
-                gen.close()
-                put(sentinel)
+                if gen is not None:
+                    gen.close()
+                put(sentinel)  # 无论上面发生什么都要收尾，否则消费者永远等不到结束
 
         # 生产端在线程里跑；消费端只认队列（不等这个 future，否则首字要等整卡结束）。
         # 线程无法被强杀：客户端断开时只能置 stop 让它在下一次 put 前收手，

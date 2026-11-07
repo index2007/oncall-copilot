@@ -445,3 +445,21 @@ def test_rerank_exception_yields_error_stage_rerank():
 
     assert [event for event, _ in collected] == ["meta", "error"]
     assert by_event(collected, "error")[0]["stage"] == "rerank"
+
+def test_verify_exception_yields_error_stage_verify(monkeypatch):
+    """校验函数自身抛异常（不是"引用非法"这种已知失败）→ 已发 delta 后收 error 帧 stage=verify。"""
+    diagnoser = make_diagnoser([make_chunk("c1")])
+    calls: list[int] = []
+
+    def boom(card, allowed):  # noqa: ANN001 - 替身不需要类型
+        raise RuntimeError("guard 内部炸了")
+
+    monkeypatch.setattr(guard_mod, "verify_citations", boom)
+    collected = events(diagnoser, "OOMKilled", make_factory([GOOD_JSON], calls))
+
+    names = [event for event, _ in collected]
+    assert "delta" in names
+    assert "done" not in names
+    error = by_event(collected, "error")[0]
+    assert error["stage"] == "verify"
+    assert "RuntimeError" in error["message"]
