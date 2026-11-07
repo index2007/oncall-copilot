@@ -531,3 +531,23 @@ def test_length_truncation_twice_degrades(monkeypatch, chunks, settings):
     assert card.summary.startswith("模型输出被 max_tokens 截断")
     assert "无法解析" not in card.summary
 
+
+def test_llm_timeout_degrades_without_retry(monkeypatch, chunks, settings):
+    """LLM 超时与 5xx 同处理：只调 1 次就降级（D8/G2）。
+
+    超时后重试只是把 30s 再花一遍，拿不到任何新信息；
+    真正需要重试的是"输出格式坏"，那条路径由 RETRY_HINT 管。
+    """
+    import httpx
+
+    fake = _install(monkeypatch, FakeLLM(httpx.ReadTimeout("read timeout")))
+    card = generator.generate(QUERY, chunks, settings=settings)
+
+    assert len(fake.calls) == 1
+    assert card.degraded is True and card.abstained is False
+    assert card.causes == []
+    assert card.abort_reason.startswith("LLM 调用失败：ReadTimeout")
+    assert card.summary.startswith("模型调用失败")
+    # 降级卡也要给出处：原文片段来自哪些块，就列哪些块（≤3）
+    assert 1 <= len(card.citations) <= 3
+    assert {c.chunk_id for c in card.citations} <= {c.chunk_id for c in chunks}

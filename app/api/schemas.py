@@ -151,6 +151,7 @@ class WebhookAlertSummary(BaseModel):
     severity: str = ""
     diagnosis_id: str = ""
     abstained: bool = False
+    degraded: bool = False  # 降级（召回单路/重排/生成失败）也要让告警侧看得见
     causes: list[str] = Field(default_factory=list)
     summary: str = ""
     latency_ms: int = 0

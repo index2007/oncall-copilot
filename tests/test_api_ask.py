@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from typing import Any, Iterator
 
@@ -273,3 +274,31 @@ def test_ask_stream_abstain_has_no_delta():
     assert done["ttft_ms"] is None
     assert done["card"]["abstained"] is True
     assert db.rows[0]["abstained"] is True
+
+class BoomDB(FakeDB):
+    """query_log 写失败（磁盘满 / SQLite locked）：旁路挂了不许影响响应。"""
+
+    def log_query(self, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_query_log_failure_does_not_break_response():
+    """D8/O1：落日志失败只警告，用户照常拿到卡。
+
+    项目日志走 loguru（不是 stdlib logging），所以不能用 caplog，要自己挂 sink；
+    断言的是"确实留了 warning"——光"没崩"不足以说明旁路失败被观测到。
+    """
+    from loguru import logger
+
+    records: list[str] = []
+    handle = logger.add(lambda msg: records.append(str(msg)), level="WARNING")
+    try:
+        db = BoomDB()
+        client = make_client(make_diagnoser(), db)
+        resp = client.post("/v1/ask", json={"query": QUERY})
+    finally:
+        logger.remove(handle)
+
+    assert resp.status_code == 200
+    assert resp.json()["card"]["summary"]
+    assert any("query_log 写入失败" in text for text in records)

@@ -398,3 +398,50 @@ def test_partial_retrieval_marks_done_card_degraded():
     assert done["card"]["degraded"] is True
     assert done["card"]["abort_reason"] == "retrieval_partial: bm25"
     assert calls == [1]
+
+def test_rerank_degraded_skips_gate_in_stream():
+    """重排整体降级时，流式也必须跳闸门一（D8/K5）。
+
+    降级后拿到的分数是 RRF 量级（1/61≈0.016），拿它去比 0.35 的阈值
+    会把所有问题都判成"没资料"，所以流水线两处都要跳过闸门。
+    """
+    def degraded_rerank(query, chunks, top_n=5):  # noqa: ANN001
+        return [
+            c.model_copy(update={"degraded": True, "rerank_score": 0.016, "rank": i})
+            for i, c in enumerate(list(chunks)[:top_n], start=1)
+        ]
+
+    diagnoser = Diagnoser(
+        retriever=FakeRetriever([make_chunk("c1", rerank=None)]),
+        settings=make_settings(),
+        rerank_fn=degraded_rerank,
+        generate_fn=lambda query, ctx: DiagnosisCard(),
+    )
+    calls: list[int] = []
+    collected = events(diagnoser, "OOMKilled", make_factory([GOOD_JSON], calls))
+
+    assert [event for event, _ in collected] == ["meta", "citations", "delta", "done"]
+    done = by_event(collected, "done")[0]
+    assert done["card"]["abstained"] is False
+    assert done["card"]["degraded"] is True
+    assert calls == [1]  # 闸门没拦，真的开了流
+
+def test_rerank_exception_yields_error_stage_rerank():
+    """D8/S4：重排段未捕获异常发 error(stage=rerank)，不发 done。
+
+    注意与"重排降级"区分：降级（HTTP 500 被 reranker 自己吃掉）走 done + degraded 卡；
+    这里注入的是 reranker 之外的意外异常（比如 top_n 传错类型）。
+    """
+    def boom_rerank(query, chunks, top_n=5):  # noqa: ANN001
+        raise RuntimeError("rerank 段意外异常")
+
+    diagnoser = Diagnoser(
+        retriever=FakeRetriever([make_chunk("c1")]),
+        settings=make_settings(),
+        rerank_fn=boom_rerank,
+        generate_fn=lambda query, ctx: DiagnosisCard(),
+    )
+    collected = events(diagnoser, "OOMKilled", make_factory([GOOD_JSON], []))
+
+    assert [event for event, _ in collected] == ["meta", "error"]
+    assert by_event(collected, "error")[0]["stage"] == "rerank"

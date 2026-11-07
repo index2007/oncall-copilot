@@ -161,6 +161,7 @@ async def receive_alertmanager(
             abstained_at = getattr(result, "abstained_at", None)
             row.diagnosis_id = card.diagnosis_id
             row.abstained = bool(card.abstained)
+            row.degraded = bool(getattr(card, "degraded", False))
             row.causes = [cause.title for cause in card.causes]
             row.summary = card.summary
             accepted += 1

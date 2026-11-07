@@ -320,3 +320,41 @@ def test_leg_errors_reset_between_calls():
     retriever.bm25 = FakeBM25([row("b1")])
     retriever.retrieve(plan)
     assert retriever.last_stats["degraded_legs"] == []
+
+class BoomStore:
+    """向量库查询必挂：LanceDB 表缺失/损坏时 search 才炸（构造期不检查）。"""
+
+    def __init__(self, exc=None):
+        self.exc = exc or FileNotFoundError("table 'chunks' not found")
+        self.calls = 0
+
+    def search(self, vector, k=20, where=None):
+        self.calls += 1
+        raise self.exc
+
+
+def test_vector_fatal_error_falls_back_to_bm25():
+    """R1：embedding 401/403/404 抛 FatalEmbeddingError（不重试的那一类），
+    与 5xx 的失败面一样——都是向量路挂，必须落到 BM25 单路而不是 500。"""
+    from app.index.embedder import FatalEmbeddingError
+
+    retriever, _ = build_faulty(vector=True)
+    retriever.embedder = BoomEmbedder(FatalEmbeddingError("401 Unauthorized"))
+    plan = analyze("Pod OOMKilled exit code 137", allow_llm=False)
+    out = retriever.retrieve(plan)
+
+    assert [c.chunk_id for c in out] == ["b1"]
+    assert retriever.last_stats["degraded_legs"] == ["vector"]
+    assert retriever.last_stats["vector_error"].startswith("FatalEmbeddingError")
+
+
+def test_vector_store_missing_table_falls_back_to_bm25():
+    """R6：LanceDB 表缺失在 search 时才炸（open_vector_store 不检查存在性）。"""
+    retriever, _ = build_faulty()
+    retriever.store = BoomStore()
+    plan = analyze("Pod OOMKilled exit code 137", allow_llm=False)
+    out = retriever.retrieve(plan)
+
+    assert [c.chunk_id for c in out] == ["b1"]
+    assert retriever.last_stats["degraded_legs"] == ["vector"]
+    assert "not found" in retriever.last_stats["vector_error"]

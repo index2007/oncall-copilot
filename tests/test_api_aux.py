@@ -386,9 +386,10 @@ def test_admin_index_failure_returns_500(tmp_path, monkeypatch):
 class _FakeDiagnoser:
     """假诊断器：记录收到的文本；fail_marker 命中时抛异常，用来验证单条隔离。"""
 
-    def __init__(self, fail_marker: str = ""):
+    def __init__(self, fail_marker: str = "", *, degraded: bool = False):
         self.texts: list[str] = []
         self.fail_marker = fail_marker
+        self.degraded = degraded
 
     def run(self, text, **_kwargs):
         self.texts.append(text)
@@ -397,6 +398,7 @@ class _FakeDiagnoser:
         card = DiagnosisCard(
             diagnosis_id="dg_test",
             summary="根因：容器内存 limit 过小",
+            degraded=self.degraded,
             causes=[Cause(title="内存 limit 过小", confidence=0.8)],
         )
         return SimpleNamespace(card=card)
@@ -526,3 +528,43 @@ def test_webhook_caps_alerts_per_request(tmp_path, monkeypatch):
     assert body["skipped"] == 1  # 第 2 条 firing 超过上限 → skipped
     assert len(body["results"]) == 1
     assert len(fake.texts) == 1  # 超上限的那条根本没调诊断
+
+def test_metrics_degraded_rate_counts_degraded_answers(tmp_path):
+    """D8/O2：降级过的请求要进 degraded_rate，否则"降级静默发生"没人看得见。"""
+    settings = make_settings(tmp_path)
+    db = prepare_index(settings)
+    db.log_query(request_id="r1", endpoint="/v1/ask", query="q1", latency_ms=1200.0, degraded=True)
+    db.log_query(request_id="r2", endpoint="/v1/ask", query="q2", latency_ms=800.0, degraded=False)
+
+    body = make_client(settings=settings, db=db).get("/v1/metrics/summary").json()
+
+    assert body["requests"] == 2
+    assert body["degraded_rate"] == pytest.approx(0.5)
+    assert body["abstain_rate"] == 0.0
+
+
+def test_webhook_passes_degraded_flag_through(tmp_path):
+    """D8/O5：webhook 返回的摘要要让告警侧看到这张卡是降级的（不是只有 query_log 里记）。"""
+    settings = make_settings(tmp_path)
+    db = prepare_index(settings)
+    fake = _FakeDiagnoser(degraded=True)
+
+    body = make_client(settings=settings, db=db, diagnoser=fake).post(
+        "/webhook/alertmanager", json=_v4_payload(_firing_alert())
+    ).json()
+
+    assert body["accepted"] == 1
+    assert body["results"][0]["degraded"] is True
+    assert db.query_log_rows(10)[0]["degraded"] == 1
+
+
+def test_webhook_default_degraded_false(tmp_path):
+    """非降级卡不能凭空标 true（否则 degraded_rate 就失去意义）。"""
+    settings = make_settings(tmp_path)
+    db = prepare_index(settings)
+
+    body = make_client(settings=settings, db=db, diagnoser=_FakeDiagnoser()).post(
+        "/webhook/alertmanager", json=_v4_payload(_firing_alert())
+    ).json()
+
+    assert body["results"][0]["degraded"] is False
