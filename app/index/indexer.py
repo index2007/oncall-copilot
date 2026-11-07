@@ -18,6 +18,7 @@ import hashlib
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -100,6 +101,20 @@ def _chunk_rows(doc: Document) -> list[dict]:
     return [c.as_row() for c in chunk(doc)]
 
 
+def _reset_stores(store: Any, db: DB) -> None:
+    """全量重建前清空两处存储。**顺序不能换**（2026-11 外部 review 复核项 A3）。
+
+    documents 表是"哪些文档已经是最新的"的唯一依据。先清它：即便进程在下一条语句前崩溃，
+    下次增量也会把所有文档判成 changed、整批重灌，自愈；向量库那时可能还是旧数据，删改
+    都会在重灌时补齐。
+    反过来先 drop 向量库再清 documents，崩在两者之间就会留下"documents 说全都最新、向量库
+    却是空的"——增量把所有文档 skip 掉，索引永久为空，只能再跑一次 --full 才救得回来。
+    """
+    db.clear()
+    store.drop()
+    store.table(create=True)
+
+
 def index_incremental(
     *,
     settings: Settings | None = None,
@@ -111,6 +126,10 @@ def index_incremental(
     trigger: str = "cli",
     progress: bool = True,
 ) -> IndexReport:
+    if full and limit is not None:
+        # --full 会清空向量库与 documents 表，--limit 只扫前 N 篇：两个一起用等于把全库
+        # 换成一个只含 N 篇的新库，而且"被删掉的文档"算不出来。调试请只用 --limit（增量语义）。
+        raise ValueError("full=True 与 limit 不能同时使用：全量重建不接受只扫一部分语料")
     started = time.perf_counter()
     settings = settings or get_settings()
     report = IndexReport(started_at=utc_now(), trigger=trigger, full_rebuild=full)
@@ -215,9 +234,7 @@ def index_incremental(
     # 全量重建要先清空：否则上次索引过、这次已从语料删除的文档，其向量会永久留在表里，
     # 检索照样能召回（documents 表标记了 is_deleted，但向量库不认这个标记）。
     if full:
-        store.drop()
-        store.table(create=True)
-        db.clear()
+        _reset_stores(store, db)
     for start in range(0, len(deleted_ids), 100):
         store.delete_docs(deleted_ids[start : start + 100])
     for entry in changed:
@@ -324,6 +341,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--k", type=int, default=5, help="--search 的返回条数")
     ap.add_argument("--json", action="store_true", help="把 IndexReport 打成 JSON")
     args = ap.parse_args(argv)
+
+    if args.full and args.limit is not None:
+        ap.error("--full 与 --limit 互斥：--full 会清空全库，--limit 只扫前 N 篇")
 
     settings = get_settings()
     if args.stats:
