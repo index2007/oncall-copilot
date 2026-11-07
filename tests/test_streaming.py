@@ -340,6 +340,22 @@ def test_retrieve_failure_yields_error():
     assert by_event(collected, "error")[0]["stage"] == "retrieve"
 
 
+def test_query_understanding_failure_yields_stage_query(monkeypatch):
+    """Query 理解失败要标 stage=query（D8/F2）：这一段还没碰过索引，
+    标成 retrieve 会把排障的人支到召回侧去。"""
+    import app.core.streaming as streaming_mod
+
+    def boom_analyze(*a, **kw):  # noqa: ANN002, ANN003
+        raise RuntimeError("规则解析炸了")
+
+    monkeypatch.setattr(streaming_mod, "analyze", boom_analyze)
+    diagnoser = make_diagnoser([make_chunk("c1")])
+    collected = events(diagnoser, "OOMKilled", make_factory([GOOD_JSON], []))
+
+    assert [event for event, _ in collected] == ["error"]
+    assert by_event(collected, "error")[0]["stage"] == "query"
+
+
 def test_done_report_can_be_reverified():
     """done 里的 report 与 guard.verify_citations 的结论一致（不是装饰字段）。"""
     diagnoser = make_diagnoser([make_chunk("c1")])

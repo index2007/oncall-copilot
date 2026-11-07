@@ -283,7 +283,7 @@ cp .env.example .env            # 仅作模板参考，真实值读 ONCALL_ENV_F
 | 2 | `citations` | `citations[]`（`chunk_id` / `title` / `heading_path` / `url`）、`context[]`（多带 `score` / `rerank_score` / `preview`） | 重排完成、开流之前——客户端先把"依据了哪几段"画出来 |
 | 3 | `delta` ×N | `text`（正文增量，可能是半截 JSON） | 模型每吐一段 |
 | 4 | `done` | `card`（完整诊断卡）、`ttft_ms`、`latency_ms`、`cost_cny`、`timings`、`report`、`regenerated`、`hit_chunk_ids` | 收尾，**以这一帧为准** |
-| — | `error` | `stage`（retrieve/rerank/generate/verify）、`message` | 任一阶段抛错；HTTP 200 已发出，错误只能走事件 |
+| — | `error` | `stage`（query/retrieve/rerank/generate/verify/internal）、`message` | 任一阶段抛出**意外**异常；HTTP 200 已发出，错误只能走事件。已知失败（召回两路皆挂、重排降级、引用两次不过）不发 `error`，走 `done` + 降级卡 |
 
 ```
 # 流式：-N 关掉 curl 的缓冲，才能看到逐帧到达

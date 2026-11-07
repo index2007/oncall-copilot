@@ -167,7 +167,8 @@ def stream_diagnose(
         timings.query_understanding_ms = (time.perf_counter() - t) * 1000
     except Exception as exc:  # noqa: BLE001 - 规则侧理论上不抛，兜底仍要收口
         logger.warning("流式 Query 理解失败：{}: {}", type(exc).__name__, exc)
-        yield _error("retrieve", exc)
+        # stage 必须是 query：这一段还没碰过召回，标成 retrieve 会让排障的人去查索引（D8/F2）
+        yield _error("query", exc)
         return
 
     yield ("meta", {"plan": plan.model_dump(), "request_id": rid})

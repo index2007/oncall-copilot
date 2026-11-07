@@ -161,7 +161,9 @@ def _sse_response(
             except BaseException as exc:  # noqa: BLE001 - 兜底：上游没料到的异常也要变成 error 帧
                 if not stop.is_set():
                     logger.warning("流式编排异常 rid={}: {}: {}", request_id, type(exc).__name__, exc)
-                    put(("error", {"stage": "generate", "message": type(exc).__name__ + ": " + str(exc)[:300]}))
+                    # 这里是"编排线程自己炸了"，不是某一段的已知失败——各段失败在
+                    # stream_diagnose 里已经变成带准确 stage 的 error 帧（D8/F2）。
+                    put(("error", {"stage": "internal", "message": type(exc).__name__ + ": " + str(exc)[:300]}))
             finally:
                 gen.close()
                 put(sentinel)

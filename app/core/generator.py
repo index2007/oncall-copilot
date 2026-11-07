@@ -812,6 +812,22 @@ def _build_card(
     )
 
 
+def _degraded_head(reason: str) -> str:
+    """降级卡的摘要头按失败类别分档（D8/F4）。
+
+    以前不分档，HTTP 401 / 超时 / 长度截断全写"输出无法解析为结构化诊断卡"，
+    排查时会把"模型连不上"误读成"模型不会写 JSON"——措辞必须等于事实。
+    """
+    reason = reason or ""
+    if reason.startswith("LLM 调用失败"):
+        return "模型调用失败（网络/鉴权/超时），已降级为原文片段（不做推理）："
+    if reason.startswith("finish_reason=length"):
+        return "模型输出被 max_tokens 截断且重试仍超长，已降级为原文片段（不做推理）："
+    if reason.startswith("json_invalid"):
+        return "模型输出无法解析为结构化诊断卡，已降级为原文片段（不做推理）："
+    return "模型输出不可用，已降级为原文片段（不做推理）："
+
+
 def _degraded_card(
     used: Sequence[ScoredChunk],
     reason: str,
@@ -823,7 +839,7 @@ def _degraded_card(
     model: str,
 ) -> DiagnosisCard:
     """降级卡：不推理、不编原因，只把原文片段摆出来。"""
-    head = "模型输出无法解析为结构化诊断卡，已降级为原文片段（不做推理）："
+    head = _degraded_head(reason)
     body = _preview_lines(used)
     summary = head + ("\n" + body if body else "")
     return _build_card(
@@ -1152,7 +1168,8 @@ def generate(
         try:
             card = _parse_card(response.content)
         except (ValueError, ValidationError) as exc:
-            last_error = type(exc).__name__ + ": " + str(exc)
+            # 与非流式 parse_diagnosis 的 reason 前缀保持一致：降级卡摘要头靠它分档（D8/F4）
+            last_error = "json_invalid: " + type(exc).__name__ + ": " + str(exc)
             logger.warning("M7 第 {} 次输出不可用：{}", attempt + 1, last_error)
             if attempt + 1 < attempts:
                 messages = messages + [

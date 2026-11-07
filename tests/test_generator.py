@@ -208,6 +208,8 @@ def test_degrade_after_two_bad_json(monkeypatch, chunks, settings):
     assert card.verify_commands == []
     # 降级摘要只摆原文片段，不做推理
     assert "已降级为原文片段" in card.summary
+    # 解析失败与调用失败必须用不同的头，否则排障方向会被带偏
+    assert card.summary.startswith("模型输出无法解析")
     assert "[k8s-oom-001]" in card.summary
     allowed = {c.chunk_id for c in chunks}
     assert {c.chunk_id for c in card.citations} <= allowed
@@ -375,6 +377,9 @@ def test_llm_exception_degrades_without_retry(monkeypatch, chunks, settings):
     assert card.causes == []
     assert "RuntimeError" in card.abort_reason
     assert card.prompt_tokens == 0
+    # 摘要头要说"调不通"，不能说成"模型写不出 JSON"（D8/F4）
+    assert card.summary.startswith("模型调用失败")
+    assert "无法解析" not in card.summary
 
 
 def test_confidence_clamped_and_service_fields_ignored(monkeypatch, chunks, settings):
@@ -522,4 +527,7 @@ def test_length_truncation_twice_degrades(monkeypatch, chunks, settings):
     assert card.causes == []
     assert "length" in card.abort_reason
     assert "[k8s-oom-001]" in card.summary
+    # 截断是"写太长"，不是"不会写 JSON"——摘要头要分得清（D8/F4）
+    assert card.summary.startswith("模型输出被 max_tokens 截断")
+    assert "无法解析" not in card.summary
 
