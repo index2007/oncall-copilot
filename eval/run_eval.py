@@ -586,7 +586,8 @@ def render_report(
         "| 数据集 | {}（{} 条：正 {} / 负 {}）{} |".format(
             args.dataset, len(rows), len(positives), len(negatives), limit_note),
         "| 变体 | {} |".format("、".join(run.metrics.label for run in runs)),
-        "| 生成模型 | {}（thinking={}） |".format(settings.llm_model, settings.llm_thinking),
+        "| 生成模型 | {}（thinking={}，temperature={}） |".format(
+            settings.llm_model, settings.llm_thinking, settings.llm_temperature),
         "| judge | {}{} |".format(
             args.judge,
             "（缓存 eval/.judge_cache.json）" if judge.enabled else "（不调 LLM，仅关键词）"),
@@ -698,6 +699,7 @@ def _json_summary(
         "judge": args.judge,
         "model": settings.llm_model,
         "thinking": settings.llm_thinking,
+        "temperature": settings.llm_temperature,
         "variants": [run.metrics.as_dict() for run in runs],
         "cost_cny": {
             "generation": gen_total,
@@ -749,6 +751,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--judge", choices=("llm", "keyword"), default="llm",
         help="根因判定方式（默认 llm：关键词漏判才调模型，结果落 eval/.judge_cache.json）",
     )
+    parser.add_argument(
+        "--temperature", type=float, default=None, metavar="T",
+        help="覆盖 llm_temperature（只影响本次评测；默认沿用配置，即 0.2。取 0 用于可复现对比）",
+    )
     parser.add_argument("--json", action="store_true", help="stdout 输出 JSON 摘要（表打到 stderr）")
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -771,7 +777,9 @@ def _print_plan(args: argparse.Namespace, variants: Sequence[str], rows: Sequenc
     positives, negatives = scoring.split_rows(rows)
     try:
         settings = get_settings()
-        model = "{}（thinking={}）".format(settings.llm_model, settings.llm_thinking)
+        model = "{}（thinking={}，temperature={}）".format(
+            settings.llm_model, settings.llm_thinking,
+            args.temperature if args.temperature is not None else settings.llm_temperature)
     except Exception as exc:  # noqa: BLE001 —— 只打印计划，配置缺也不该炸
         model = "读取配置失败：{}".format(exc)
     print("运行计划（--dry-run：不建索引、不调模型、不花钱）")
@@ -822,6 +830,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     settings = get_settings()
+    if args.temperature is not None:
+        settings = settings.model_copy(update={"llm_temperature": args.temperature})
+        print("已覆盖 llm_temperature={}（只影响本次评测）".format(settings.llm_temperature),
+              file=sys.stderr)
     judge = JudgeRunner(
         settings, _EVAL_DIR / JUDGE_CACHE_NAME, enabled=(args.judge == "llm"),
     )
