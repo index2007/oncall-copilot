@@ -23,7 +23,7 @@ from app.config import Settings, get_settings
 from app.core import guard as guard_mod
 from app.core import reranker as rerank_mod
 from app.core.query_understanding import analyze
-from app.core.retriever import Retriever
+from app.core.retriever import Retriever, RetrievalFailed
 from app.core.schemas import CitationReport, DiagnosisCard, QueryPlan, ScoredChunk
 
 
@@ -53,7 +53,7 @@ class DiagnoseResult:
     context: list[ScoredChunk] = field(default_factory=list)
     report: CitationReport | None = None
     timings: StageTiming = field(default_factory=StageTiming)
-    abstained_at: str | None = None  # gate / generator / None
+    abstained_at: str | None = None  # retrieval / gate / generator / None
     regenerated: bool = False
 
     @property
@@ -92,6 +92,32 @@ def _abstain_card(plan: QueryPlan, hits: list[ScoredChunk], reason: str, top_sco
         abort_reason=reason,
         degraded=False,
     )
+
+
+def _retrieval_failed_card(plan: QueryPlan, exc: RetrievalFailed) -> DiagnosisCard:
+    """两路召回都不可用时的拒答卡（D8/F1）。
+
+    与"检索不到"的区别写在 abort_reason 上：retrieval_failed = 查不了（索引/密钥/依赖坏了），
+    no_hits = 查得到但没有相关内容。degraded 同时置真，观测侧能单独统计这一类，
+    不会把它混进拒答准确率的分母里当成模型判错。
+    """
+    summary = "召回失败（向量路与 BM25 路都不可用），按设计拒绝作答（retrieval_failed）。"
+    detail = str(exc)[:200]
+    if detail:
+        summary += " 失败原因：" + detail
+    return DiagnosisCard(
+        abstained=True,
+        summary=summary,
+        causes=[],
+        abort_reason="retrieval_failed",
+        degraded=True,
+    )
+
+
+def _degraded_legs(retriever: Retriever) -> list[str]:
+    """本次召回有几路是降级回来的（D8/F1：Retriever.last_stats["degraded_legs"]）。"""
+    stats = getattr(retriever, "last_stats", None) or {}
+    return [str(x) for x in (stats.get("degraded_legs") or [])]
 
 
 def _degraded_card(card: DiagnosisCard, context: list[ScoredChunk], report: CitationReport) -> DiagnosisCard:
@@ -158,8 +184,23 @@ class Diagnoser:
         timings.query_understanding_ms = (time.perf_counter() - t) * 1000
 
         t = time.perf_counter()
-        hits = self.retriever.retrieve(plan, limit=s.top_k_fuse)
+        try:
+            hits = self.retriever.retrieve(plan, limit=s.top_k_fuse)
+        except RetrievalFailed as exc:
+            # 查不了 ≠ 没命中（D8/F1）：不 500，给一张结构完整的降级拒答卡，HTTP 层照常 200。
+            # 真正不可预期的异常仍向上抛，由 app/main.py 的 500 兜底（那里的语义是"服务出事了"）。
+            logger.warning("召回失败，转降级拒答卡：{}", exc)
+            timings.retrieve_ms = (time.perf_counter() - t) * 1000
+            timings.total_ms = (time.perf_counter() - t0) * 1000
+            card = _retrieval_failed_card(plan, exc).model_copy(
+                update={"latency_ms": int(timings.total_ms)}
+            )
+            result = DiagnoseResult(query=text, plan=plan, card=card, hits=[], context=[], timings=timings)
+            result.abstained_at = "retrieval"
+            return result
         timings.retrieve_ms = (time.perf_counter() - t) * 1000
+        # 单路降级要读一次：后面的重排/生成不该再去碰 retriever 的内部状态。
+        partial_legs = _degraded_legs(self.retriever)
 
         t = time.perf_counter()
         context = self._rerank(plan.search_text, hits, top_n=top_n or s.top_k_final) if hits else []
@@ -175,7 +216,9 @@ class Diagnoser:
             top = _top_score(context)
             card = _abstain_card(plan, context, "low_confidence" if context else "no_hits", top)
             timings.total_ms = (time.perf_counter() - t0) * 1000
-            result.card = card.model_copy(update={"latency_ms": int(timings.total_ms)})
+            result.card = card.model_copy(
+                update={"latency_ms": int(timings.total_ms), "degraded": bool(partial_legs)}
+            )
             result.abstained_at = "gate"
             return result
 
@@ -229,8 +272,13 @@ class Diagnoser:
         if card.abstained and result.abstained_at is None:
             result.abstained_at = "generator"
 
-        if rerank_degraded:
+        if rerank_degraded or partial_legs:
             card = card.model_copy(update={"degraded": True})
+
+        # 单路召回降级在卡上留痕。不覆盖已有的 abstain 原因：low_confidence /
+        # citations_invalid 比"少了一路召回"更有信息量，混在一起反而查不出根因。
+        if partial_legs and not card.abstained and not card.abort_reason:
+            card = card.model_copy(update={"abort_reason": "retrieval_partial: " + ", ".join(partial_legs)})
 
         timings.total_ms = (time.perf_counter() - t0) * 1000
         result.card = card.model_copy(update={"latency_ms": int(timings.total_ms)})

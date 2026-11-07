@@ -13,6 +13,15 @@ query 侧的两个细节：
 2. 命中子库（QueryPlan.sub_index）时加元数据过滤：向量路用 LanceDB where，
    BM25 路在打分遍历里过滤。但过滤只提精度、不能牺牲召回——融合后不足 limit 时
    自动补跑一次不限源的召回，把缺的补齐（宁可多给重排器几条）。
+
+降级（D8/F1）：两路召回各自兜底，单路失败只丢那一路的候选，另一路照常融合——
+embedding 401、LanceDB 目录坏了、bm25.pkl 丢了都不该让整个问诊失败。两路**都**失败
+才算"查不了"（RetrievalFailed），由编排层转成拒答卡；这与"两路都成功但都没命中"
+（返回空列表，正常走 no_hits 拒答）是两件事，不能混成一种。
+
+单路降级不往 chunk 上打 degraded 标记：重排成功时 reranker 会把参与重排的块重写成
+degraded=False（app/core/reranker.py），标记会被冲掉。改由 last_stats["degraded_legs"]
+上报，编排层读完写卡的 degraded 与 abort_reason（retrieval_partial: vector）。
 """
 
 from __future__ import annotations
@@ -36,6 +45,23 @@ def _quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+class RetrievalFailed(RuntimeError):
+    """两路召回都不可用（是"查不了"，不是"没命中"）。
+
+    携带两路各自的错误摘要，便于编排层写进降级卡、日志里看出到底哪一路先挂。
+    """
+
+    def __init__(self, vector_error: str | None, bm25_error: str | None):
+        self.vector_error = vector_error
+        self.bm25_error = bm25_error
+        parts = []
+        if vector_error:
+            parts.append("向量路 " + vector_error)
+        if bm25_error:
+            parts.append("BM25 路 " + bm25_error)
+        super().__init__("；".join(parts) or "两路召回均不可用")
+
+
 class Retriever:
     def __init__(
         self,
@@ -50,6 +76,12 @@ class Retriever:
         self.embedder = embedder
         self.settings = settings or get_settings()
         self.last_stats: dict[str, Any] = {}
+        # 单路失败原因（每次 retrieve 开头清空）。None = 该路正常。
+        self.vector_error: str | None = None
+        self.bm25_error: str | None = None
+        # 装配时就已知 BM25 索引是空的（pkl 缺失/损坏被 BM25Store.load 吞成空索引）。
+        # 只有 from_settings 会置它：单测里手工构造的空 BM25 是"没数据"，不是"坏了"。
+        self.bm25_loaded_empty: bool = False
 
     # -- 装配 --------------------------------------------------
     @classmethod
@@ -67,13 +99,25 @@ class Retriever:
             timeout=s.embed_timeout_s,
             price_cny_per_mtok=s.embed_price_cny_per_mtok,
         )
-        return cls(store=store, bm25=bm25, embedder=embedder, settings=s)
+        retriever = cls(store=store, bm25=bm25, embedder=embedder, settings=s)
+        # BM25Store.load(missing_ok=True) 对缺失/空的 pkl 只告警、返回空索引，
+        # search() 随后静默返回 []——"没索引"和"没命中"在查询侧长得一模一样。
+        # 装配期就把这件事钉成标记，查询时如实记成单路降级，而不是装作没命中。
+        retriever.bm25_loaded_empty = len(getattr(bm25, "rows", [])) == 0
+        if retriever.bm25_loaded_empty:
+            logger.warning("BM25 索引为空（{}），本次进程内 BM25 一路始终降级", s.bm25_path)
+        return retriever
 
     # -- 单路召回 ----------------------------------------------
     def vector_search(self, q: QueryPlan, k: int | None = None, *, where: str | None = None) -> list[ScoredChunk]:
         k = k or self.settings.top_k_vec
-        vector = self.embedder.embed_one(q.search_text)
-        rows = self.store.search(vector, k=k, where=where)
+        try:
+            vector = self.embedder.embed_one(q.search_text)
+            rows = self.store.search(vector, k=k, where=where)
+        except Exception as exc:  # noqa: BLE001 - 单路失败不该影响另一路
+            self.vector_error = type(exc).__name__ + ": " + str(exc)[:200]
+            logger.warning("向量召回失败，降级为 BM25 单路：{}", self.vector_error)
+            return []
         out: list[ScoredChunk] = []
         for i, row in enumerate(rows, start=1):
             score = float(row.get("score") or 0.0)
@@ -82,7 +126,16 @@ class Retriever:
 
     def bm25_search(self, q: QueryPlan, k: int | None = None, *, source: str | None = None) -> list[ScoredChunk]:
         k = k or self.settings.top_k_bm25
-        rows = self.bm25.search(q.search_text, k=k, source=source)
+        try:
+            rows = self.bm25.search(q.search_text, k=k, source=source)
+        except Exception as exc:  # noqa: BLE001 - 单路失败不该影响另一路
+            self.bm25_error = type(exc).__name__ + ": " + str(exc)[:200]
+            logger.warning("BM25 召回失败，降级为向量单路：{}", self.bm25_error)
+            return []
+        if not rows and self.bm25_loaded_empty:
+            # 空索引不会抛异常（见 BM25Store.load），只能靠装配期的标记认出来
+            self.bm25_error = "EmptyBM25Index: bm25.pkl 缺失或为空（BM25Store.load 返回空索引）"
+            return []
         out: list[ScoredChunk] = []
         for i, row in enumerate(rows, start=1):
             score = float(row.get("score") or 0.0)
@@ -133,6 +186,8 @@ class Retriever:
     ) -> list[ScoredChunk]:
         started = time.perf_counter()
         limit = limit or self.settings.top_k_fuse
+        self.vector_error = None
+        self.bm25_error = None
         if use_sub_index is None:
             use_sub_index = self.settings.sub_index_filter
         sub = q.sub_index if use_sub_index else None
@@ -147,6 +202,15 @@ class Retriever:
         vec = self.vector_search(q, where=where)
         embed_ms = (time.perf_counter() - vec_started) * 1000
         bm = self.bm25_search(q, source=sub)
+
+        # 两路都失败 = 查不了（索引坏 / 密钥错），不是"没命中"。必须抛，不能返回 []：
+        # 返回空会被当成 no_hits 正常拒答，观测侧就看不出"是坏了还是真没资料"。
+        if self.vector_error and self.bm25_error:
+            self.last_stats = self._stats(
+                q, sub, vec=vec, bm=bm, fused=[], embed_ms=embed_ms, started=started
+            )
+            raise RetrievalFailed(self.vector_error, self.bm25_error)
+
         fused = self.rrf_fuse(vec, bm, k=self.settings.rrf_k, limit=limit)
 
         if sub and len(fused) < limit:
@@ -156,7 +220,26 @@ class Retriever:
             fused = self.rrf_fuse(vec, bm, vec_all, bm_all, k=self.settings.rrf_k, limit=limit)
             fallback = True
 
-        self.last_stats = {
+        self.last_stats = self._stats(
+            q, sub, vec=vec, bm=bm, fused=fused, embed_ms=embed_ms, started=started, fallback=fallback
+        )
+        return fused
+
+    def _stats(
+        self,
+        q: QueryPlan,
+        sub: str | None,
+        *,
+        vec: list[ScoredChunk],
+        bm: list[ScoredChunk],
+        fused: list[ScoredChunk],
+        embed_ms: float,
+        started: float,
+        fallback: bool = False,
+    ) -> dict[str, Any]:
+        """一份检索现场。失败路径也要有（否则抛异常时调用方读不到哪一路挂了）。"""
+        legs = [name for name, err in (("vector", self.vector_error), ("bm25", self.bm25_error)) if err]
+        return {
             "query": q.clean,
             "sub_index": sub,
             "filtered": bool(sub),
@@ -166,8 +249,11 @@ class Retriever:
             "fused": len(fused),
             "vector_ms": round(embed_ms, 1),
             "total_ms": round((time.perf_counter() - started) * 1000, 1),
+            # 降级口径：degraded_legs 非空 = 少了一路（另一路照常用）。空 = 两路都正常。
+            "vector_error": self.vector_error,
+            "bm25_error": self.bm25_error,
+            "degraded_legs": legs,
         }
-        return fused
 
     def retrieve_text(self, text: str, *, limit: int | None = None, **kw: Any) -> tuple[QueryPlan, list[ScoredChunk]]:
         plan = analyze(text)

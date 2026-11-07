@@ -14,6 +14,7 @@ from app.config import Settings
 from app.core import guard as guard_mod
 from app.core.generator import StreamFailed
 from app.core.pipeline import Diagnoser
+from app.core.retriever import RetrievalFailed
 from app.core.schemas import DiagnosisCard, ScoredChunk
 from app.core.streaming import stream_diagnose
 
@@ -47,8 +48,35 @@ class FakeRetriever:
         return list(self.chunks)
 
 
+class FailedRetriever:
+    """两路召回都不可用（D8/F1）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+        self.last_stats: dict[str, Any] = {"degraded_legs": ["vector", "bm25"]}
+
+    def retrieve(self, q, *, limit=None, use_sub_index=None):  # noqa: ANN001
+        self.calls.append(limit)
+        raise RetrievalFailed("RuntimeError: embeddings HTTP 401", "FileNotFoundError: data/bm25.pkl 不存在")
+
+
+class PartialRetriever(FakeRetriever):
+    def __init__(self, chunks: list[ScoredChunk], legs: tuple[str, ...] = ("bm25",)):
+        super().__init__(chunks)
+        self.last_stats: dict[str, Any] = {"degraded_legs": list(legs)}
+
+
 def fake_rerank(query: str, chunks: list[ScoredChunk], top_n: int = 5) -> list[ScoredChunk]:
     return list(chunks)[:top_n]
+
+
+def make_diagnoser_with(retriever: Any) -> Diagnoser:
+    return Diagnoser(
+        retriever=retriever,
+        settings=make_settings(),
+        rerank_fn=fake_rerank,
+        generate_fn=lambda query, ctx: DiagnosisCard(),
+    )
 
 
 def make_diagnoser(chunks: list[ScoredChunk]) -> Diagnoser:
@@ -321,3 +349,36 @@ def test_done_report_can_be_reverified():
     report = guard_mod.verify_citations(card, {"c1"})
     assert report.ok
     assert report.total == done["report"]["total"]
+
+
+def test_retrieval_failed_ends_with_done_not_error():
+    """两路召回都挂（D8/F1）：这是"查不了"，不是断流——meta → citations(空) → done。"""
+    diagnoser = make_diagnoser_with(FailedRetriever())
+    calls: list[int] = []
+    collected = events(diagnoser, "OOMKilled", make_factory([GOOD_JSON], calls))
+
+    assert [event for event, _ in collected] == ["meta", "citations", "done"]
+    assert by_event(collected, "error") == []
+    assert by_event(collected, "citations")[0]["citations"] == []
+    done = by_event(collected, "done")[0]
+    assert done["card"]["abstained"] is True
+    assert done["card"]["degraded"] is True
+    assert done["card"]["abort_reason"] == "retrieval_failed"
+    assert "401" in done["card"]["summary"]
+    assert done["abstained_at"] == "retrieval"
+    assert done["ttft_ms"] is None
+    assert calls == []  # 没有上下文，不该开流
+
+
+def test_partial_retrieval_marks_done_card_degraded():
+    """单路召回降级：照常流式作答，done 里的卡标 degraded 并记 retrieval_partial。"""
+    diagnoser = make_diagnoser_with(PartialRetriever([make_chunk("c1")], legs=("bm25",)))
+    calls: list[int] = []
+    collected = events(diagnoser, "OOMKilled", make_factory([GOOD_JSON], calls))
+
+    assert [event for event, _ in collected] == ["meta", "citations", "delta", "done"]
+    done = by_event(collected, "done")[0]
+    assert done["card"]["abstained"] is False
+    assert done["card"]["degraded"] is True
+    assert done["card"]["abort_reason"] == "retrieval_partial: bm25"
+    assert calls == [1]

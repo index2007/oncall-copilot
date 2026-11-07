@@ -12,6 +12,7 @@ import pytest
 
 from app.config import Settings
 from app.core.pipeline import Diagnoser, StageTiming
+from app.core.retriever import RetrievalFailed
 from app.core.schemas import Cause, Citation, DiagnosisCard, Evidence, ScoredChunk
 
 
@@ -38,6 +39,30 @@ class FakeRetriever:
     def retrieve(self, q, *, limit=None, use_sub_index=None):  # noqa: ANN001
         self.calls.append({"query": getattr(q, "search_text", ""), "limit": limit})
         return list(self.chunks)
+
+
+class FailedRetriever:
+    """两路召回都不可用（D8/F1）：retrieve 抛 RetrievalFailed，不是返回空列表。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_stats: dict[str, Any] = {
+            "degraded_legs": ["vector", "bm25"],
+            "vector_error": "RuntimeError: embeddings HTTP 401",
+            "bm25_error": "FileNotFoundError: data/bm25.pkl 不存在",
+        }
+
+    def retrieve(self, q, *, limit=None, use_sub_index=None):  # noqa: ANN001
+        self.calls += 1
+        raise RetrievalFailed(self.last_stats["vector_error"], self.last_stats["bm25_error"])
+
+
+class PartialRetriever(FakeRetriever):
+    """单路召回降级：照常返回候选，但 last_stats 里记了 degraded_legs。"""
+
+    def __init__(self, chunks: list[ScoredChunk], legs: tuple[str, ...] = ("vector",)):
+        super().__init__(chunks)
+        self.last_stats: dict[str, Any] = {"degraded_legs": list(legs)}
 
 
 def fake_generate_factory(cards: list[DiagnosisCard]):
@@ -117,6 +142,48 @@ def test_degraded_rerank_skips_gate():
     assert res.abstained is False
     assert gen.calls == [1]
     assert res.card.degraded is True  # 降级要标在卡上
+
+
+def test_retrieval_failed_returns_degraded_abstain_card():
+    """查不了 ≠ 没命中（D8/F1）：出拒答卡、标 degraded、不调 LLM、不抛给 API 层。"""
+    gen = fake_generate_factory([GOOD_CARD])
+    retriever = FailedRetriever()
+    d = Diagnoser(retriever, settings(), rerank_fn=fake_rerank(), generate_fn=gen)
+    res = d.run("Pod OOMKilled")
+    assert retriever.calls == 1
+    assert gen.calls == []  # 没有候选，不许调 LLM
+    assert res.card.abstained is True
+    assert res.card.degraded is True
+    assert res.card.causes == []
+    assert res.card.abort_reason == "retrieval_failed"
+    assert "401" in res.card.summary  # 失败原因要留在卡上
+    assert res.abstained_at == "retrieval"
+    assert res.hits == [] and res.context == []
+
+
+def test_partial_retrieval_marks_card_degraded():
+    """单路召回降级：仍正常作答，但卡上要有 degraded 与 retrieval_partial 原因。"""
+    ctx = [make_chunk("c_1", rerank=0.9)]
+    gen = fake_generate_factory([GOOD_CARD])
+    d = Diagnoser(PartialRetriever(ctx), settings(), rerank_fn=fake_rerank(), generate_fn=gen)
+    res = d.run("Pod 起不来")
+    assert res.card.abstained is False
+    assert res.card.degraded is True
+    assert res.card.abort_reason == "retrieval_partial: vector"
+    assert len(gen.calls) == 1
+
+
+def test_partial_retrieval_does_not_override_gate_reason():
+    """单路失败但不跳闸门：闸门照常判，abstain 原因保留 low_confidence。"""
+    ctx = [make_chunk("c_1", rerank=0.10)]
+    gen = fake_generate_factory([GOOD_CARD])
+    d = Diagnoser(PartialRetriever(ctx), settings(abstain_threshold=0.35), rerank_fn=fake_rerank(), generate_fn=gen)
+    res = d.run("服务器很慢")
+    assert res.card.abstained is True
+    assert res.abstained_at == "gate"
+    assert res.card.degraded is True  # 降级留痕
+    assert res.card.abort_reason == "low_confidence"  # 但原因不被覆盖
+    assert gen.calls == []
 
 
 def test_verify_failure_regenerates_once_then_degrades():

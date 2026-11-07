@@ -307,7 +307,7 @@ data: {"card":{"diagnosis_id":"dg_...","abstained":false,"causes":[...],"verify_
 三个必须知道的点：
 
 - **`delta` 是过程，`done.card` 是结论**。引用校验不过时会在同一条流里重生成一次（不发明新事件），客户端会看到两段 JSON 拼在一起；解析以 `done` 为准，不要边收边解析。
-- **拒答也是 200 + 正常帧**：`citations` 之后直接 `done`，`card.abstained=true`、`card.abort_reason=low_confidence|no_hits`，整个响应 690 ms 左右、不调 LLM、0 元。
+- **拒答也是 200 + 正常帧**：`citations` 之后直接 `done`，`card.abstained=true`、`card.abort_reason=low_confidence|no_hits|retrieval_failed`，整个响应 690 ms 左右、不调 LLM、0 元。召回两路都不可用时也走这条：`citations` 是空数组，`done` 照发（不是 `error` 帧）。
 - 响应头带 `Cache-Control: no-cache` 与 `X-Accel-Buffering: no`（后者给 Nginx 反向代理用，不加会被缓冲成一坨）。
 
 ### 7.2 POST /v1/diagnose
@@ -323,7 +323,7 @@ data: {"card":{"diagnosis_id":"dg_...","abstained":false,"causes":[...],"verify_
 | `plan` | Query 理解产物（与 `meta` 帧同构） |
 | `citations` | 上下文里被引用到的 chunk（窄对象） |
 | `report` | 引用校验报告：`total` / `valid` / `invalid_ids` / `orphan_causes` / `coverage` |
-| `abstained_at` | 拒答发生在哪一档：`gate`（重排分数低，未进 LLM）/ `generator` / `null` |
+| `abstained_at` | 拒答发生在哪一档：`retrieval`（两路召回都不可用，见 §9 第 19 条）/ `gate`（重排分数低，未进 LLM）/ `generator` / `null` |
 | `regenerated` | 是否因引用校验失败重生成过一次 |
 | `timings` | 分段耗时：`query_understanding_ms` / `retrieve_ms` / `rerank_ms` / `generate_ms` / `verify_ms` / `total_ms` |
 
@@ -336,9 +336,9 @@ data: {"card":{"diagnosis_id":"dg_...","abstained":false,"causes":[...],"verify_
 | `verify_commands[]` | 只读核验命令（≤3 条，写操作会被白名单过滤掉） |
 | `actions[]` | 处置建议（≤3 条） |
 | `citations[]` | `chunk_id` / `title` / `heading_path` / `url`，**只可能出现在本次上下文里** |
-| `abstained` / `abort_reason` | 是否拒答、拒答原因 |
+| `abstained` / `abort_reason` | 是否拒答、拒答原因（`low_confidence` / `no_hits` / `insufficient_evidence` / `citations_invalid` / `retrieval_failed`；单路召回失败但正常作答时写 `retrieval_partial: vector` / `bm25`） |
 | `latency_ms` / `ttft_ms` / `cost_cny` | 整卡耗时（端点自己盖，不信模型）、首字耗时、成本 |
-| `degraded` | 走降级路径（重排失败退回 RRF / JSON 解析失败 / 引用两次都不过） |
+| `degraded` | 走降级路径（召回单路失败 / 重排失败退回 RRF / JSON 解析失败 / 引用两次都不过） |
 | `model` / `prompt_tokens` / `completion_tokens` | 模型与 token 用量 |
 
 ### 7.3 POST /webhook/alertmanager
@@ -489,6 +489,7 @@ curl 'http://127.0.0.1:8000/v1/sources/c_c97fd0c9d2'
 16. **3 条正样本仍误拒**（e012 / e019 / e029）：全部是模型自己判"证据不足"（`abort_reason=insufficient_evidence`），不是闸门一。闸门 ROC（§9 第 4 条）显示阈值 0.35 已在平台区；把拒答规则再放宽会开始吃负样本（当前拒答准确 90.0%）。另外 e019 / e029 在不同轮次里会时拒时答——这是生成侧的残余抖动，固定 temperature 后仍有。
 17. **Top-3 与 Top-1 完全相等（都是 92.5%）**：37 条作答样本里，主因全部命中，Top-3 没有额外救回任何一条；3 条未命中全是拒答（abstain 卡没有 `causes`，Top-1/Top-3 同时记零）。也就是说 Top-3 这一列当前没有独立信息量，它的瓶颈与 Top-1 是同一个：误拒。
 18. **评测口径与线上温度不一致**：§8/§8.1 的数字都在 `--temperature 0` 下跑（同一输入同一输出、可复现），线上 `llm_temperature` 仍是 0.2。温度 0 明显更准也更稳定（同一套代码在 0.2 下多轮跑出 80.0% / 87.5% 两个值），但两种温度没有做 A/B 正式对照；要让"线上=评测"完全一致，得把默认温度也改成 0，这属 D8 之后的决定。
+19. **召回只坏一路时，卡的 `abort_reason` 可能只报下游原因**：`abort_reason` 是单值字段（D7 定的口径）。两路召回都不可用 → `abstained=true` + `degraded=true` + `abort_reason=retrieval_failed` + `abstained_at=retrieval`，HTTP 仍是 200；只坏一路 → 交给出问题的那路退出、另一路照常作答，卡上 `degraded=true` + `abort_reason=retrieval_partial: vector|bm25`。但如果这一路降级之后处理链又在闸门/生成侧拒答，`abort_reason` 只会保留下游那个原因（如 `low_confidence`），召回侧的原因只剩 `retriever.last_stats['degraded_legs']` 与日志里能查到——`degraded=true` 仍然成立，只是不指名是哪一路。
 
 ---
 
@@ -524,7 +525,7 @@ oncall-copilot/
 | D5 | API 全量（SSE / webhook / admin）+ 日志 | ✅ 完成（7 接口 + SSE 帧序 + query_log + metrics；9 次流式实测：首字 P50 1177 ms、整卡 P50 2324 ms、¥0.0043/次；171 个单测） |
 | D6 | 评测集 + 评测脚本 | ✅ 完成（50 条：40 正 + 10 负，47 个 gold url 逐条核对命中语料；五档变体 + LLM judge 缓存；11 列基线表） |
 | D7 | 5 变体基线 + 调参（唯一止损点） | ✅ 完成（2025-11-07）：五档同口径全量（`eval/report_d7.md`，temperature=0）。full 档 Top-1 **92.5%**、Top-3 **92.5%**、recall@20 97.5%、拒答准确 90.0%、误拒率 7.5%、整卡 P50 3251 / P95 4230 ms、成本 ¥0.0065——除**引用命中 89.2%**（差 1 条样本）与**首字 P50 1233 ms**（差 33 ms）外全部过线。归因见 §9 第 14-18 条 |
-| D8 | 降级路径测试 + pytest | 未开工（用例集见 `docs/D8-降级路径测试用例集.md`） |
+| D8 | 降级路径测试 + pytest | 🚧 进行中：F1（召回单路/双路降级）已修，召回侧 6 条用例转绿；用例集见 `docs/D8-降级路径测试用例集.md`，余下 S1-S4 待做 |
 | D9-D10 | 演示脚本 + 录屏 + README 定稿 | 未开工 |
 
 设计文档：[技术路线与设计清单.md](../技术路线与设计清单.md)（v1.9）

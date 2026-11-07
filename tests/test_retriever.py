@@ -11,7 +11,7 @@ import types
 import pytest
 
 from app.core.query_understanding import analyze
-from app.core.retriever import Retriever
+from app.core.retriever import RetrievalFailed, Retriever
 from app.core.schemas import ScoredChunk
 from app.index.vector_store import VectorStore
 
@@ -222,3 +222,101 @@ def test_empty_index_returns_empty():
     retriever, _, _, _ = build([], [])
     plan = analyze("500 错误", allow_llm=False)
     assert retriever.retrieve(plan) == []
+    # 空索引是"没命中"，不是"查不了"：不许降级、不许抛
+    assert retriever.last_stats["degraded_legs"] == []
+    assert retriever.last_stats["vector_error"] is None
+
+
+# ---------------------------------------------------------------- 单路降级（D8/F1）
+class BoomEmbedder:
+    """向量路必挂：embedding 401（FatalEmbeddingError 的现实形态）。"""
+
+    def __init__(self, exc=None):
+        self.exc = exc or RuntimeError("embeddings HTTP 401")
+        self.calls = 0
+
+    def embed_one(self, text):
+        self.calls += 1
+        raise self.exc
+
+
+class BoomBM25:
+    def __init__(self, exc=None):
+        self.exc = exc or FileNotFoundError("data/bm25.pkl 不存在")
+        self.calls = 0
+
+    def search(self, query, k=20, source=None):
+        self.calls += 1
+        raise self.exc
+
+
+def build_faulty(*, vector=False, bm25=False, store_rows=None, bm25_rows=None):
+    store = FakeStore(store_rows if store_rows is not None else [row("v1")])
+    bm = BoomBM25() if bm25 else FakeBM25(bm25_rows if bm25_rows is not None else [row("b1")])
+    emb = BoomEmbedder() if vector else FakeEmbedder()
+    return Retriever(store=store, bm25=bm, embedder=emb, settings=make_settings()), bm
+
+
+def test_vector_failure_falls_back_to_bm25():
+    retriever, _ = build_faulty(vector=True)
+    plan = analyze("Pod OOMKilled exit code 137", allow_llm=False)
+    out = retriever.retrieve(plan)
+    assert [c.chunk_id for c in out] == ["b1"]  # 另一路照常出候选
+    assert retriever.last_stats["degraded_legs"] == ["vector"]
+    assert retriever.last_stats["vector_error"].startswith("RuntimeError")
+    assert retriever.last_stats["vector_candidates"] == 0
+    # 降级标记走 last_stats，不往 chunk 上打（重排成功会把它冲掉）
+    assert all(c.degraded is False for c in out)
+
+
+def test_bm25_failure_falls_back_to_vector():
+    retriever, _ = build_faulty(bm25=True)
+    plan = analyze("Pod OOMKilled exit code 137", allow_llm=False)
+    out = retriever.retrieve(plan)
+    assert [c.chunk_id for c in out] == ["v1"]
+    assert retriever.last_stats["degraded_legs"] == ["bm25"]
+    assert retriever.last_stats["bm25_error"].startswith("FileNotFoundError")
+
+
+def test_both_legs_failed_raises_retrieval_failed():
+    retriever, _ = build_faulty(vector=True, bm25=True)
+    plan = analyze("Pod OOMKilled exit code 137", allow_llm=False)
+    with pytest.raises(RetrievalFailed) as exc_info:
+        retriever.retrieve(plan)
+    assert "向量路" in str(exc_info.value)
+    assert "BM25 路" in str(exc_info.value)
+    # 抛异常前也要有现场，否则调用方读不到哪一路挂了
+    assert retriever.last_stats["degraded_legs"] == ["vector", "bm25"]
+    assert retriever.last_stats["fused"] == 0
+
+
+def test_empty_bm25_index_loaded_from_disk_marks_partial():
+    """bm25.pkl 缺失时 BM25Store.load 只告警、返回空索引，search 静默返回 []。
+    装配期标记 + 查询期留痕，才能把"没索引"与"没命中"分开（D8/F1）。"""
+    retriever, _ = build_faulty(vector=False, bm25_rows=[])
+    retriever.bm25_loaded_empty = True
+    plan = analyze("Pod OOMKilled exit code 137", allow_llm=False)
+    out = retriever.retrieve(plan)
+    assert [c.chunk_id for c in out] == ["v1"]
+    assert retriever.last_stats["degraded_legs"] == ["bm25"]
+    assert retriever.last_stats["bm25_error"].startswith("EmptyBM25Index")
+
+
+def test_hand_built_empty_bm25_is_not_degraded():
+    """手工构造的空 BM25（单测常态）不算坏掉，否则每个空集用例都会被标降级。"""
+    retriever, _store, _bm25, _emb = build([row("c1")], [])
+    plan = analyze("500 错误", allow_llm=False)
+    retriever.retrieve(plan)
+    assert retriever.last_stats["degraded_legs"] == []
+
+
+def test_leg_errors_reset_between_calls():
+    """上一次失败的记录不能泄漏到下一次（否则会被误判成两路全挂）。"""
+    retriever, _ = build_faulty(bm25=True)
+    retriever.embedder = FakeEmbedder()
+    plan = analyze("Pod OOMKilled exit code 137", allow_llm=False)
+    retriever.retrieve(plan)
+    assert retriever.last_stats["vector_error"] is None
+    retriever.bm25 = FakeBM25([row("b1")])
+    retriever.retrieve(plan)
+    assert retriever.last_stats["degraded_legs"] == []

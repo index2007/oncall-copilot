@@ -30,7 +30,16 @@ from loguru import logger
 from app.config import Settings, get_settings
 from app.core import guard as guard_mod
 from app.core.generator import _parse_card, finalize_stream, open_stream
-from app.core.pipeline import Diagnoser, StageTiming, _abstain_card, _degraded_card, _top_score
+from app.core.pipeline import (
+    Diagnoser,
+    StageTiming,
+    _abstain_card,
+    _degraded_card,
+    _degraded_legs,
+    _retrieval_failed_card,
+    _top_score,
+)
+from app.core.retriever import RetrievalFailed
 from app.core.query_understanding import analyze
 from app.core.schemas import Citation, CitationReport, DiagnosisCard, QueryPlan, ScoredChunk
 from app.obs.logging import current_request_id, new_request_id
@@ -168,10 +177,36 @@ def stream_diagnose(
         t = time.perf_counter()
         hits: list[ScoredChunk] = diagnoser.retriever.retrieve(plan, limit=s.top_k_fuse)
         timings.retrieve_ms = (time.perf_counter() - t) * 1000
+    except RetrievalFailed as exc:
+        # 两路召回都挂（D8/F1）：这是"查不了"，不是"链路中途坏了"。走与非流式同一张
+        # 降级拒答卡，用 done 收尾——error 帧留给真正的意外异常（客户端据此判断断流重试）。
+        logger.warning("流式召回失败，转降级拒答卡：{}", exc)
+        timings.retrieve_ms = (time.perf_counter() - t) * 1000
+        timings.total_ms = (time.perf_counter() - started) * 1000
+        card = _retrieval_failed_card(plan, exc).model_copy(
+            update={"latency_ms": int(timings.total_ms)}
+        )
+        yield ("citations", _citations_frame([]))
+        yield (
+            "done",
+            _done_payload(
+                card,
+                ttft_ms=None,
+                timings=timings,
+                report=None,
+                regenerated=False,
+                hits=[],
+                abstained_at="retrieval",
+            ),
+        )
+        return
     except Exception as exc:  # noqa: BLE001
         logger.warning("流式召回失败：{}: {}", type(exc).__name__, exc)
         yield _error("retrieve", exc)
         return
+
+    # 单路降级要在这里读一次：重排之后 retriever 的内部状态不该再被依赖。
+    partial_legs = _degraded_legs(diagnoser.retriever)
 
     # -- 3. 重排 -----------------------------------------------------------
     try:
@@ -196,7 +231,9 @@ def stream_diagnose(
         top = _top_score(context)
         card = _abstain_card(plan, context, "low_confidence" if context else "no_hits", top)
         timings.total_ms = (time.perf_counter() - started) * 1000
-        card = card.model_copy(update={"latency_ms": int(timings.total_ms)})
+        card = card.model_copy(
+            update={"latency_ms": int(timings.total_ms), "degraded": bool(partial_legs)}
+        )
         yield (
             "done",
             _done_payload(
@@ -311,8 +348,11 @@ def stream_diagnose(
         card = _degraded_card(card, context, report).model_copy(
             update={"abstained": True, "abort_reason": "citations_invalid"}
         )
-    if rerank_degraded:
+    if rerank_degraded or partial_legs:
         card = card.model_copy(update={"degraded": True})
+    # 单路召回降级留痕，但不覆盖已有的 abstain 原因（口径与 pipeline.run 一致）
+    if partial_legs and not card.abstained and not card.abort_reason:
+        card = card.model_copy(update={"abort_reason": "retrieval_partial: " + ", ".join(partial_legs)})
 
     timings.total_ms = (time.perf_counter() - started) * 1000
     card = card.model_copy(update={"latency_ms": int(timings.total_ms), "ttft_ms": ttft_ms})
