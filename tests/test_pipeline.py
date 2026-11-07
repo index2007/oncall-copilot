@@ -221,6 +221,34 @@ def test_generate_exception_becomes_degraded_card():
     assert "boom" in res.card.summary
 
 
+def test_second_generate_failure_is_not_misreported_as_citation_invalid():
+    """第 1 轮引用校验不过、第 2 轮生成直接抛错：归因必须是"生成失败"。
+
+    旧实现在第 2 轮抛错后仍拿着第 1 轮的 CitationReport 往下走，_degraded_card 把摘要改成
+    "引用全部未通过校验"、abort_reason 写成 citations_invalid —— 排障会去查模型编引用，
+    实际是模型调不通（2026-11 外部 review 复核项 A4）。
+    """
+    ctx = [make_chunk("c_1", rerank=0.9)]
+    calls: list[int] = []
+
+    def gen(query: str, chunks: list[ScoredChunk]) -> DiagnosisCard:
+        calls.append(len(chunks))
+        if len(calls) == 1:
+            return BAD_CARD  # 引用指向不存在的块
+        raise RuntimeError("upstream 502")
+
+    d = Diagnoser(FakeRetriever(ctx), settings(), rerank_fn=fake_rerank(), generate_fn=gen)
+    res = d.run("Pod 起不来")
+
+    assert len(calls) == 2
+    assert res.regenerated is True
+    assert res.card.degraded is True
+    assert str(res.card.abort_reason or "").startswith("generate_failed")
+    assert "upstream 502" in res.card.summary
+    assert "引用" not in res.card.summary
+    assert res.report is None
+
+
 def test_timings_and_summary_row():
     ctx = [make_chunk("c_1", rerank=0.9)]
     gen = fake_generate_factory([GOOD_CARD])

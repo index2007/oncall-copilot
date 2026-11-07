@@ -234,7 +234,15 @@ class Diagnoser:
             except Exception as exc:  # noqa: BLE001 - 生成模块自身应降级，这里兜底
                 logger.warning("生成失败，转降级卡：{}: {}", type(exc).__name__, exc)
                 timings.generate_ms += (time.perf_counter() - t) * 1000
-                card = DiagnosisCard(degraded=True, summary="生成失败：" + str(exc)[:200])
+                card = DiagnosisCard(
+                    degraded=True,
+                    summary="生成失败：" + str(exc)[:200],
+                    abort_reason="generate_failed: " + type(exc).__name__,
+                )
+                # 必须把上一轮（引用未过）的 report 丢掉：否则下面 _degraded_card 会拿旧的
+                # invalid_ids 把"生成失败"改写成"引用校验未通过"，abort_reason 也变成
+                # citations_invalid —— 排障时会去查模型编引用，实际是模型调不通（A4）。
+                report = None
                 break
             timings.generate_ms += (time.perf_counter() - t) * 1000
 
