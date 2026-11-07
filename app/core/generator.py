@@ -501,11 +501,21 @@ _WRITE_TOKENS = frozenset(
     }
 )
 
-# curl 只放行"读"：任何可能改状态或落盘的参数都直接拒绝
+# curl 只放行"读"：任何可能改状态、落盘、或从文件读配置/凭据的参数都直接拒绝。
+# 注意匹配是 startswith 且 token 已 lower（-T 会被 -t 兜住，-D 会被 -d 兜住）。
 _CURL_DENY_FLAGS = (
     "-x", "--request", "-d", "--data", "-f", "--form", "-t", "--upload-file",
-    "-o", "--output",
+    "-o", "--output", "--output-dir",
+    # 配置文件与凭据文件：可以带进任意 URL/输出参数，等于绕过上面全部限制
+    "--config", "-c", "--cookie-jar", "--netrc", "--netrc-file",
+    # 落盘/追踪类
+    "--trace", "--trace-ascii", "--trace-config", "--stderr", "--libcurl",
+    "--dump-header",
 )
+
+# 大小写不敏感会撞车的那几个：-K(--config) vs -k(--insecure)、-D(--dump-header) vs -d(--data)。
+# 前者的写文件能力必须拒，后者已经在 _CURL_DENY_FLAGS 里（-D 落进 -d 一并拒掉）。
+_CURL_DENY_CASE_SENSITIVE = ("-K",)
 
 _PLACEHOLDER_RE = re.compile(r"<[^<>]*>")
 _SHELL_SEP_RE = re.compile(r"\|\||&&|\||;")
@@ -545,8 +555,11 @@ def is_read_only_command(command: str) -> bool:
         if program in {"kubectl", "oc"}:
             if len(tokens) < 2 or lows[1] not in _KUBECTL_READ_VERBS:
                 return False
-        if program == "curl" and any(t.startswith(_CURL_DENY_FLAGS) for t in lows):
-            return False
+        if program == "curl":
+            if any(t.startswith(_CURL_DENY_FLAGS) for t in lows):
+                return False
+            if any(t.startswith(_CURL_DENY_CASE_SENSITIVE) for t in tokens):
+                return False
         for token in lows:
             if token.startswith("-"):
                 continue

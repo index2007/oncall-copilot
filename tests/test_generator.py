@@ -413,6 +413,10 @@ def test_confidence_clamped_and_service_fields_ignored(monkeypatch, chunks, sett
         "journalctl -u kubelet --since '1 hour ago'",
         "df -h && free -m",
         "systemctl status kubelet",
+        "curl -sS --max-time 5 https://<service>/healthz",
+        "curl -s http://127.0.0.1:9090/metrics | head -20",
+        # -k（跳过证书校验）不落盘、不改状态，仍然只读；只有大写 -K（读配置文件）要拒
+        "curl -k -s https://<service>/healthz",
     ],
 )
 def test_read_only_commands_allowed(command):
@@ -434,6 +438,15 @@ def test_read_only_commands_allowed(command):
         "rm -rf /data",
         "systemctl restart kubelet",
         "echo $(rm -rf /)",
+        # curl 的"读"承诺：落盘或从文件读配置/凭据的写法一律拒绝（D8 复核 A2）
+        "curl https://api.example.com/health -o /tmp/h.txt",
+        "curl https://api.example.com -K cfg.txt",
+        "curl https://api.example.com --config cfg.txt",
+        "curl https://api.example.com -c /tmp/cookies.txt",
+        "curl https://api.example.com --cookie-jar /tmp/cookies.txt",
+        "curl https://api.example.com --netrc-file /root/.netrc",
+        "curl https://api.example.com --trace-ascii /tmp/trace.txt",
+        "curl https://api.example.com --libcurl /tmp/poc.c",
         "",
     ],
 )
