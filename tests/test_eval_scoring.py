@@ -330,6 +330,24 @@ def test_apply_judge_only_pays_for_keyword_misses() -> None:
     assert m.judge_used == 1
 
 
+def test_judge_cache_key_depends_on_model_and_prompt(tmp_path, monkeypatch) -> None:
+    """judge 缓存 key 必须含判分口径（模型 + prompt），否则换模型后静默复用旧判定。"""
+    import run_eval
+    from app.config import Settings
+
+    base = Settings(_env_file=None)  # type: ignore[call-arg]
+    cache = tmp_path / "judge.json"
+
+    a = run_eval.JudgeRunner(base, cache, enabled=False)
+    b = run_eval.JudgeRunner(base.model_copy(update={"llm_model": "另一个-judge"}), cache, enabled=False)
+    assert a._key("gold", "candidate") == run_eval.JudgeRunner(base, cache, enabled=False)._key("gold", "candidate")
+    assert a._key("gold", "candidate") != b._key("gold", "candidate")
+
+    monkeypatch.setattr(run_eval, "JUDGE_USER_PROMPT", run_eval.JUDGE_USER_PROMPT + "\n请更严格。")
+    c = run_eval.JudgeRunner(base, cache, enabled=False)
+    assert c._key("gold", "candidate") != a._key("gold", "candidate")
+
+
 def test_dump_results_writes_rerank_top1_jsonl(tmp_path) -> None:
     """阈值标定吃的是逐条 rerank_top1，不是聚合表；这里钉住落盘字段与行序。"""
     import run_eval  # 只测纯落盘：_dump_results 不碰网络、不建索引
@@ -357,4 +375,6 @@ def test_dump_results_writes_rerank_top1_jsonl(tmp_path) -> None:
     assert lines[0]["rerank_top1"] == 0.5587
     assert lines[1]["negative"] is True and lines[1]["abstained"] is True
     assert lines[0]["citations"] == [GOLD]
+    # 单看 recall_urls 分不清"召回池里没有"和"召回有但没喂进 prompt"
+    assert lines[0]["context_urls"] == [] and lines[1]["context_urls"] == []
     assert {"variant", "ttft_ms", "cost_cny", "causes", "recall_urls"} <= set(lines[0])

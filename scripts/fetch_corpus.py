@@ -565,6 +565,17 @@ def run(
     return stats
 
 
+def _exit_code(results: list[dict], *, dry_run: bool = False) -> int:
+    """退出码：只有"真的抓失败了且一篇没落"才算失败。
+
+    幂等重跑（内容都在库里、全部跳过）是成功的正常态：0 新增 0 失败必须 exit 0，
+    否则编排脚本/CI 会把"没事可做"读成"抓取挂了"（2026-11 外部 review 复核项 A6）。
+    """
+    if dry_run or any(r["saved"] for r in results):
+        return 0
+    return 1 if any(r["failed"] for r in results) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -624,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
     total_saved = sum(r["saved"] for r in results)
     total_chars = sum(r["chars"] for r in results)
     log(f"\n合计新增 {total_saved} 篇 / {total_chars} 字 → {CONTENT_DIR}")
-    return 0 if total_saved or args.dry_run else 1
+    return _exit_code(results, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

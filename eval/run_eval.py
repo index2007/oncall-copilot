@@ -172,7 +172,8 @@ class JudgeRunner:
     """LLM-as-judge：候选根因与 gold_root_cause 是否语义一致，结果落盘复用。
 
     只判"关键词没命中"的样本（scoring.cause_hit 先走关键词），所以正常一轮下来调用量
-    远小于样本数 x 3。缓存 key = sha256(gold + 换行 + candidate)，同一对永远只花一次钱。
+    远小于样本数 x 3。缓存 key = sha256(判分环境指纹 + gold + candidate)：指纹含模型名与
+    两段 prompt 原文，换模型或改 prompt 后旧缓存自动失效，不会拿上一版口径的结果给这一版打分。
     """
 
     def __init__(self, settings: Settings, cache_path: Path, *, enabled: bool = True):
@@ -185,6 +186,7 @@ class JudgeRunner:
         self.completion_tokens = 0
         self._call = generator_mod.default_llm_callable(settings) if self.enabled else None
         self._entries = self._load()
+        self._fingerprint = self._judge_fingerprint()
 
     # -- 缓存 --------------------------------------------------
     def _load(self) -> dict[str, Any]:
@@ -209,8 +211,20 @@ class JudgeRunner:
         except OSError as exc:  # 缓存写不了不该毁掉整轮结果
             logger.warning("judge 缓存写入失败：{}", exc)
 
+    def _judge_fingerprint(self) -> str:
+        """判分口径指纹：模型 + 两段 prompt 原文。
+
+        以前 key 只有 (gold, candidate)，换了 judge 模型或改了 prompt 会静默复用旧判定，
+        指标就不可复现了——评测里的"缓存命中"必须建立在同一口径上。
+        """
+        payload = "\x00".join(
+            [self.settings.llm_model, JUDGE_SYSTEM_PROMPT, JUDGE_USER_PROMPT]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
     def _key(self, gold: str, candidate: str) -> str:
-        return hashlib.sha256((gold + "\n" + candidate).encode("utf-8")).hexdigest()
+        raw = self._fingerprint + "\n" + gold + "\n" + candidate
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     # -- 判定（给 scoring.Judge 用）----------------------------
     def verdict(self, candidate: str, row: scoring.EvalRow) -> bool | None:
@@ -679,6 +693,9 @@ def _dump_results(
                     "causes": list(res.causes),
                     "citations": list(res.citations),
                     "recall_urls": list(res.recall_urls),
+                    # 真正喂进 prompt 的那几块（≤ top_k_final）：失败归因要区分
+                    # "召回池里没有"与"召回有但没进上下文"，只有 recall_urls 看不出来。
+                    "context_urls": list(res.context_urls),
                 }, ensure_ascii=False) + "\n")
 
 
