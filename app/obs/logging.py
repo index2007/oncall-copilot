@@ -43,15 +43,27 @@ def set_request_id(rid: str) -> None:
     _REQUEST_ID.set(rid)
 
 
+def _inject_request_id(record: dict) -> bool:
+    """把当前请求 id 写进每一条日志。
+
+    必须用赋值而不是 setdefault：logger.configure(extra={"request_id": "-"}) 已经把这个键
+    预置到每条 record 上，setdefault 永远命中那个默认值，于是日志里的 rid 恒为 "-"
+    （2026-11 外部 review 复核时实测确认）。这里改成无条件覆盖。
+    """
+    record["extra"]["request_id"] = current_request_id()
+    return True
+
+
 def setup_logging(level: str = "INFO", log_file: Path | str | None = None) -> None:
     """幂等：重复调用只保留一个 handler，避免 uvicorn reload 后日志翻倍。"""
     logger.remove()
+    # 兜底：没挂 filter 的 handler（第三方库加 sink 的场景）也不会 KeyError
     logger.configure(extra={"request_id": "-"})
     logger.add(
         sys.stderr,
         level=level.upper(),
         format=CONSOLE_FORMAT,
-        filter=lambda record: record["extra"].setdefault("request_id", current_request_id()) or True,
+        filter=_inject_request_id,
         enqueue=False,
     )
     if log_file:
@@ -64,4 +76,5 @@ def setup_logging(level: str = "INFO", log_file: Path | str | None = None) -> No
             retention=5,
             encoding="utf-8",
             format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <7} | {extra[request_id]} | {message}",
+            filter=_inject_request_id,
         )

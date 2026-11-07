@@ -176,7 +176,9 @@ def _sse_response(
         # 生产端在线程里跑；消费端只认队列（不等这个 future，否则首字要等整卡结束）。
         # 线程无法被强杀：客户端断开时只能置 stop 让它在下一次 put 前收手，
         # 最坏情况要等当前这次 LLM 读超时（llm_timeout_s）。
-        future = loop.run_in_executor(None, pump)
+        # 用 to_thread 而不是 loop.run_in_executor：前者会把 contextvars 复制进工作线程，
+        # 后者不会——用 run_in_executor 时生产端日志拿不到当前请求 id（恒为 "-"）。
+        future = loop.create_task(asyncio.to_thread(pump))
 
         def _on_pump_done(fut: Any) -> None:
             # 取一次异常，避免线程里逃出来的异常变成 "exception was never retrieved"

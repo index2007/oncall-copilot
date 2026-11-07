@@ -23,6 +23,7 @@ from app.config import Settings
 from app.core.generator import StreamFailed
 from app.core.pipeline import Diagnoser
 from app.core.schemas import DiagnosisCard, ScoredChunk
+from app.obs.logging import current_request_id
 
 QUERY = "Pod 一直 OOMKilled 重启，exit code 137"
 
@@ -321,3 +322,29 @@ def test_ask_stream_pump_crash_yields_internal_stage(monkeypatch):
     error = frames[0][1]
     assert error["stage"] == "internal"
     assert "RuntimeError" in error["message"]
+
+
+def test_ask_stream_producer_thread_sees_request_id(monkeypatch):
+    """生产端跑在 asyncio.to_thread 里：线程内日志拿到的 rid 必须是本次请求的 rid。
+
+    用 loop.run_in_executor 时 contextvars 不会复制进工作线程，线程内日志恒为 "-"
+    （2026-11 外部 review 复核项 A1）。这里让替身在"被执行的那一刻"读一次 rid。
+    """
+    db = FakeDB()
+    seen: list[str] = []
+
+    def fake_stream(diagnoser, query, **kw):
+        seen.append(current_request_id())
+        yield ("meta", {"request_id": kw.get("request_id"), "plan": {"search_text": "x"}})
+        yield ("done", {"card": {"summary": "ok", "abstained": False}, "hit_chunk_ids": []})
+
+    monkeypatch.setattr(ask_mod, "stream_diagnose", fake_stream)
+    client = make_client(make_diagnoser(), db)
+
+    with client.stream("POST", "/v1/ask", json={"query": QUERY, "stream": True}) as resp:
+        frames = parse_sse(resp.iter_lines())
+
+    meta = [data for event, data in frames if event == "meta"][0]
+    assert seen == [meta["request_id"]]
+    assert seen[0] != "-"
+
