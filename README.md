@@ -2,7 +2,7 @@
 
 > 把「线上出事了」这句求助，变成一张可机读、带引用的结构化诊断卡。
 
-**状态**：D7 评测完成（五档同口径，`--temperature 0`）——full 档 Top-1 **92.5%**、Top-3 **92.5%**、拒答准确 90.0%、整卡 P50 3251 ms / P95 4230 ms、¥0.0065/次；仅引用命中 89.2%（差 1 条样本）与首字 P50 1233 ms（差 33 ms）未过线，归因见 §9 第 14-18 条。**D8 降级路径测试已完成**（39 条用例全部 ✅，用例集见 `docs/D8-降级路径测试用例集.md`，pytest 217 passed）；D9-D10 未开工。指标数字一律来自可重跑的脚本（`eval/report_d7.md`、`data/bench_stream.json`），不填预计值。
+**状态**：**D1–D9 完成，D10 未开工**。评测（五档同口径，`--temperature 0`）：full 档 Top-1 **87.5%–92.5%**（两次全量观测，见 §8.2）、Top-3 90.0%–92.5%、拒答准确 90.0%、整卡 P50 3.3 s / P95 4.2 s、¥0.0065/次；引用命中 89.2%（差 1 条样本）与首字 P50 1233–1308 ms（差 33–108 ms）未过线，归因见 §9 第 14–18 条。降级路径 39 条用例全部 ✅（`docs/D8-降级路径测试用例集.md`）。所有指标来自可重跑的脚本（`eval/report_d7.md`、`eval/report_d9_full.md`、`data/bench_stream.json`），不填预计值。
 
 ```
 报错文本 / Alertmanager 告警
@@ -12,14 +12,70 @@
         ├─ 双路召回：LanceDB 向量 Top20  │  BM25（jieba 分词）Top20
         │        └──── RRF 融合（k=60，只用排名不用分数）────┐
         │                                                    │
-        ├─ Cross-Encoder 重排（bge-reranker-v2-m3）→ Top5 上下文
+        ├─ Cross-Encoder 重排（bge-reranker-v2-m3）→ Top8 上下文（每文档 ≤2 块）
         │        └─ Top1 < ABSTAIN_THRESHOLD → 直接拒答，不进 LLM
         │
         ├─ LLM 生成结构化诊断卡（Pydantic v2 校验，JSON mode）
-        │        └─ 引用后校验：chunk_id 必须出现在本次上下文，否则丢弃重生成一次 → 再失败降级原文片段
+        │        ├─ 先净化：不在本次上下文里的 chunk_id / evidence 全丢，没有证据的 cause 整条不输出
+        │        └─ 再校验（对象是净化前的原始卡）：不过就重生成一次 → 两次都不过则缩成拒答（abstained + degraded）
         │
         └─ 输出：诊断卡（causes / verify_commands / actions / citations / latency / cost）
 ```
+
+**模块与数据流**（上面是请求链路，下面是代码分层与落盘位置）：
+
+```mermaid
+flowchart LR
+    subgraph clients["调用方"]
+        A1["值班人 / curl<br/>POST /v1/ask · /v1/diagnose"]
+        A2["Alertmanager<br/>POST /webhook/alertmanager"]
+    end
+    subgraph api["app/api（FastAPI）"]
+        B1["ask / diagnose<br/>SSE 与非流式"]
+        B2["webhook<br/>v4 payload 解析"]
+        B3["sources / admin / metrics / health"]
+    end
+    subgraph core["app/core（编排与算法）"]
+        C1["query_understanding<br/>正则 + 词表，未命中才调 LLM"]
+        C2["retriever<br/>向量 + BM25 → RRF"]
+        C3["reranker<br/>cross-encoder 打分"]
+        C4["generator<br/>prompt + JSON 校验 + 净化"]
+        C5["guard<br/>引用校验 / 拒答闸门"]
+        C6["streaming / pipeline<br/>两条编排，共用同一套组件"]
+    end
+    subgraph idx["app/index（离线索引）"]
+        D1["chunker<br/>H2/H3 切分"]
+        D2["embedder<br/>缓存 + 重试"]
+        D3["vector_store<br/>LanceDB"]
+        D4["bm25_store<br/>rank_bm25 + jieba"]
+    end
+    subgraph obs["app/obs"]
+        E1["db（SQLite）<br/>documents / chunks / query_log"]
+        E2["logging<br/>request_id 贯通"]
+    end
+    subgraph ext["外部 HTTP（本机不装模型）"]
+        F1["硅基流动<br/>bge-m3（1024 维）"]
+        F2["硅基流动<br/>bge-reranker-v2-m3"]
+        F3["DeepSeek<br/>deepseek-flash"]
+    end
+    A1 --> B1 --> C6
+    A2 --> B2 --> C6
+    C6 --> C1 --> C2 --> C3 --> C4
+    C6 --> C5
+    C4 --> F3
+    C2 --> F1
+    C3 --> F2
+    C2 --> D3
+    C2 --> D4
+    C4 --> D3
+    B3 --> E1
+    C6 --> E2
+    D1 --> D2 --> D3
+    D1 --> D4
+    E1 -.-> D3
+```
+
+> 图里刻意没画"服务注册 / 消息队列 / 网关"——这套东西是单进程 + 两个嵌入式存储（LanceDB、SQLite），进程一起即全部依赖就位；多副本扩展是 Non-Goal（见 §9 第 2 条）。
 
 ---
 
@@ -191,7 +247,7 @@ chunk 数 2099，落在设计清单 v1.4 的目标区间 1800-2200 内（v1.3 �
 **但 P95 不是稳定的数**：整卡 ≈ 输出 token ÷ 130 tok/s + 0.8 s，而同一 prompt 下模型输出在 243-906 tokens 之间摆动，输出写到 900+ tokens 就是 7 s+，写到 1000+ tokens 必然破 8 s（本机无法控制）。所以别把「P95 达标」当成可承诺的 SLA，可承诺的只有 D5 的首 token ≤1.2 s。
 
 - 延迟由输出 token 数决定，不由检索决定：生成占总耗时 72%-91%，deepseek-flash 实测约 130 tok/s（443 tok ≈ 3.4 s、906 tok ≈ 7.0 s）；检索 250 ms + 重排 498 ms + 校验 <10 ms 合计不到 0.8 s，没有多少可压。
-- 已压缩两轮：上下文预算 6000→3600 字符（最多 8 块，每文档 ≤2 块；v1.9 前是 2600 / 5 块）；prompt 与生成侧双写死上限（summary ≤80 字、causes ≤2、explanation ≤50 字、verify_commands ≤3、actions ≤3 条且每条 ≤45 字）；`finish_reason=length` 走"更短重试"。第一轮（972 completion tokens）实测 8274 / 8129 / 14028 ms，第二轮降到上表的 P50 4480 ms。
+- 已压缩两轮：上下文预算 6000→3600 字符（最多 8 块，每文档 ≤2 块；v1.9 前是 2600 / 5 块）；prompt 与生成侧双写死上限（summary ≤80 字、causes ≤3、explanation ≤50 字、verify_commands ≤3、actions ≤3 条且每条 ≤45 字）；`finish_reason=length` 走"更短重试"。第一轮（972 completion tokens）实测 8274 / 8129 / 14028 ms，第二轮降到上表的 P50 4480 ms。
 - 剩余方差来自模型自己写多长：prompt 写了"≤420 tokens"，实测仍有 906 tokens 的输出。生成侧硬截断只能裁字段，裁不掉已经花掉的 token，所以截断不省时间。
 - 重排候选数不是瓶颈：20 条 498 ms / 12 条 365 ms / 8 条 376 ms（固定开销约 300 ms），砍候选只省 0.13 s，不值得牺牲排序质量。
 - 9 次里 0 次 JSON 解析失败、0 次重试；引用校验全部 ok；nginx 3 次全由生成侧 abstain（语料只有官方模块参考页，没有 502/504 排障页，见 §9 第 9 条），不是链路故障。
@@ -246,7 +302,55 @@ cp .env.example .env            # 仅作模板参考，真实值读 ONCALL_ENV_F
 # 6. 起服务
 .venv/Scripts/python.exe -m uvicorn app.main:app --reload
 # → http://127.0.0.1:8000/docs
+
+# 7. 跑测试（242 条，全离线：不调外部 API、不需要密钥、约 3 s）
+.venv/Scripts/python.exe -m pytest -q
+
+# 8. 演示（需要服务已起）
+.venv/Scripts/python.exe scripts/simulate_alert.py   # 5 个 Alertmanager v4 告警 → 5 张卡
+.venv/Scripts/python.exe scripts/demo.py             # 单条，打 SSE 分段耗时与门槛判定
 ```
+
+### 6.1 两分钟演示（本机真实输出）
+
+`scripts/simulate_alert.py` 内置 5 个真实故障场景，字段与 Alertmanager v4 对齐（`--dry-run` 只打印不发）。这是 2026-11-08 本机实跑的输出，不是示意：
+
+```text
+[oom] accepted=1 skipped=0 latency=3438 ms
+    KubePodOOMKilled -> 诊断 | 内存超 limit 被 OOM 杀死；容器反复启动失败；Terminated 状态需查退出码
+[nginx502] accepted=1 skipped=0 latency=1919 ms
+    NginxUpstream5xx -> 拒答 | 候选块均为 Pod 调试、探针、ConfigMap 等通用内容，无 upstream prematurely close
+[mysql-deadlock] accepted=1 skipped=0 latency=3610 ms
+    MySQLDeadlockDetected -> 诊断 | 加锁顺序不一致致循环等待；FOR UPDATE 加锁范围过大；UPDATE 子查询加共享锁
+[redis-memory] accepted=1 skipped=0 latency=3116 ms
+    RedisUsedMemoryHigh -> 诊断 | 未设淘汰策略默认noeviction；used_memory逼近maxmemory；客户端连接占用内存
+[node-notready] accepted=1 skipped=0 latency=2843 ms
+    KubeNodeNotReady -> 诊断 | 节点内存不足触发驱逐；容器运行时不可用致 NotReady；节点关闭或 kubelet 失联
+```
+
+5 条里 4 条出卡、1 条拒答——**nginx 那条拒答是设计使然，不是故障**：语料里没有 502/504 排障专页，只有模块参数参考（§9 第 9 条），重排 Top1 没过闸门，系统选择说"没查到"而不是编。
+
+`scripts/demo.py` 走 SSE，把"开流前就发引用"和分段耗时打出来：
+
+```text
+Query 理解 : resource=pod intent=diagnose llm=False | 条款 8 条
+已定引用   : 8 条（开流前就发了）
+summary    : 容器内存使用超过 512Mi limit 被内核 OOM 杀死（exit 137），kubelet 重启后再次超限，形成反复重启。
+  1. 内存超 limit 被 OOMKilled (confidence=0.9)  evidence: c_9484839c6f
+  2. 容器反复启动失败 BackOff (confidence=0.6)   evidence: c_5943104dff
+  3. 用 describe 确认终止原因 (confidence=0.5)   evidence: c_51409d7539
+
+  首 token : 1270 ms
+  retrieve_ms           309.8 ms
+  rerank_ms             382.0 ms
+  generate_ms           2609.5 ms
+  成本     : ￥0.007748
+  整卡     : 3353 ms
+
+门槛: 首字 1270 ms (<= 1200 ms) / 整卡 3353 ms (<= 4500 ms) -> FAIL
+```
+
+末行 `FAIL` 与退出码 2 表示**首字超了 1.2 s 门槛**（1270 ms），不是脚本报错——这就是 §9 第 3 条那条已知缺陷，脚本按其判定退出，方便 CI 盯着；整卡 3353 ms 达标。想复现不同症状：`--symptom "..."`；不想起服务看结构：`--no-stream` 走 `/v1/diagnose`。
 
 ---
 
@@ -272,7 +376,7 @@ cp .env.example .env            # 仅作模板参考，真实值读 ONCALL_ENV_F
 |---|---|---|---|
 | `query` | string | 是 | 报错文本 / 告警文本，1-4000 字 |
 | `stream` | bool | 否 | 默认 `false`；`true` 返回 `text/event-stream` |
-| `top_n` | int 1-20 | 否 | 最终上下文条数，缺省取 `TOP_K_FINAL=5` |
+| `top_n` | int 1-20 | 否 | 最终上下文条数，缺省取 `TOP_K_FINAL=8` |
 | `allow_llm` | bool | 否 | Query 理解是否允许调 LLM；缺省按"规则没命中且 query>20 字"自动决定 |
 
 非流式响应见 7.2（两者同构）。流式时按下面的帧序推送，`event:` 与 `data:` 两行一组：
@@ -332,13 +436,13 @@ data: {"card":{"diagnosis_id":"dg_...","abstained":false,"causes":[...],"verify_
 | 字段 | 说明 |
 |---|---|
 | `summary` | 一句话结论（≤80 字） |
-| `causes[]` | 根因列表（≤2 条），每条 `title` / `confidence`(0-1) / `explanation` / `evidence[]` |
+| `causes[]` | 根因列表（≤3 条，第 1 条是主因），每条 `title` / `confidence`(0-1) / `explanation` / `evidence[]` |
 | `verify_commands[]` | 只读核验命令（≤3 条，写操作会被白名单过滤掉） |
 | `actions[]` | 处置建议（≤3 条） |
 | `citations[]` | `chunk_id` / `title` / `heading_path` / `url`，**只可能出现在本次上下文里** |
-| `abstained` / `abort_reason` | 是否拒答、拒答原因（`low_confidence` / `no_hits` / `insufficient_evidence` / `citations_invalid` / `retrieval_failed`；单路召回失败但正常作答时写 `retrieval_partial: vector` / `bm25`） |
+| `abstained` / `abort_reason` | 是否拒答、拒答原因（`low_confidence` / `no_hits` / `insufficient_evidence` / `citations_invalid` / `no_causes` / `retrieval_failed`；单路召回失败但正常作答时写 `retrieval_partial: vector` / `bm25`） |
 | `latency_ms` / `ttft_ms` / `cost_cny` | 整卡耗时（端点自己盖，不信模型）、首字耗时、成本 |
-| `degraded` | 走降级路径（召回单路失败 / 重排失败退回 RRF / JSON 解析失败 / 引用两次都不过） |
+| `degraded` | 走降级路径（召回单路失败 / 重排失败退回 RRF / JSON 解析失败 / 生成失败 / 引用两次都不过） |
 | `model` / `prompt_tokens` / `completion_tokens` | 模型与 token 用量 |
 
 ### 7.3 POST /webhook/alertmanager
@@ -467,6 +571,26 @@ curl 'http://127.0.0.1:8000/v1/sources/c_c97fd0c9d2'
 
 **为什么误拒率和拒答准确率必须并排**：只报拒答准确率，把 `ABSTAIN_THRESHOLD` 调到 0.9 就能刷到 100%——正样本全被误杀，指标却更好看。两个数一起看才知道阈值是不是在「该拒的拒了、不该拒的没拒」。列顺序与 `eval/scoring.py` 的 `TABLE_HEADER` 逐字一致（11 列）。
 
+### 8.2 重复性与调优历程
+
+**先说重复性**：表里每一格都是**单次全量**。同一配置（temperature=0、同一 prompt、同一索引）隔一天再跑一遍 full 档，Top-1 从 92.5% 掉到 **87.5%**（报告 `eval/report_d9_full.md`），30/50 行的 `causes` 措辞都不一样——温度 0 只保证"参数上不采样"，在线 API 仍有批处理/路由带来的非确定性。n=40 正样本时 **1 条 = 2.5 pp**，所以：
+
+- 绝对值按区间看：full 档 Top-1 ≈ **87.5%–92.5%**（两次观测），不是精确的 92.5%。
+- 跨档差距小于 7.5 pp 的不要过度解读（重排掉分那 7.5 pp 正好在这个尺度上，它的证据是逐条归因 §9 第 14 条，不只是总分）。
+- 想压掉这层噪声只有加样本量（40 条 × 3 次取均值，成本 ×3），当前不做，如实报区间。
+
+**调优历程**（每一步都对应一个可回放的 commit，不是事后叙述）：
+
+| # | 改动 | 实测影响 | 为什么这么改 |
+|---|---|---|---|
+| 1 | 关掉思考（`LLM_THINKING=disabled`） | 整卡 P50 约 4.2 s → 2.3 s；首字 523 ms | 思考 token 既慢又不可控，诊断卡是填模板任务 |
+| 2 | 拒答规则改三档（有字面对应必须作答）+ `causes` 上限 2→3 | 误拒 13/40 → 7/40；Top-1 67.5% → 80.0% | 旧规则把"只覆盖故障链一部分"当证据不足，13 条正样本被误杀 |
+| 3 | 选块「重排前 5」→「前 8 + 每文档 ≤2」；上下文预算 2600→3600 字符 | 误拒 7/40 → 2/40；Top-1 80.0% → 90.0% | 离线重放证明 gold 进上下文的比例 34/40 → 39/40，但只加块数不改配额收益为 0 |
+| 4 | 模型漏写 `citations` 时用已校验证据回填（只补出处，不替模型挑块） | 引用命中 86.8% → 89.2%；消灭"有结论零出处"的卡 | 实测 e040：causes 3 条、citations 0 条 |
+| 5 | `ABSTAIN_THRESHOLD` 用 50 条评测算 ROC | 结论：**维持 0.35** | 0.30–0.45 都是"抓 6/10 负样本、误拒 0%"，抬高只增误拒，护栏收益仅 +1 条 |
+| 6 | 评测固定 `--temperature 0` | 多轮不再大幅抖动（但仍有 ±2 条样本，见上） | 线上仍 0.2；两种温度没做正式 A/B，差异记在 §9 第 18 条 |
+| 7 | `causes=[]` 且未声明拒答 → 转拒答（`no_causes`） | 不再产出"有摘要没结论"的空卡 | 下游引用校验看到 `total=0` 会判 `ok=True`，等于把"什么都没答出来"记成一次成功 |
+
 ---
 
 ## 9. 已知缺陷与限制
@@ -491,6 +615,8 @@ curl 'http://127.0.0.1:8000/v1/sources/c_c97fd0c9d2'
 18. **评测口径与线上温度不一致**：§8/§8.1 的数字都在 `--temperature 0` 下跑（同一输入同一输出、可复现），线上 `llm_temperature` 仍是 0.2。温度 0 明显更准也更稳定（同一套代码在 0.2 下多轮跑出 80.0% / 87.5% 两个值），但两种温度没有做 A/B 正式对照；要让"线上=评测"完全一致，得把默认温度也改成 0，这属 D8 之后的决定。
 19. **召回只坏一路时，卡的 `abort_reason` 可能只报下游原因**：`abort_reason` 是单值字段（D7 定的口径）。两路召回都不可用 → `abstained=true` + `degraded=true` + `abort_reason=retrieval_failed` + `abstained_at=retrieval`，HTTP 仍是 200；只坏一路 → 交给出问题的那路退出、另一路照常作答，卡上 `degraded=true` + `abort_reason=retrieval_partial: vector|bm25`。但如果这一路降级之后处理链又在闸门/生成侧拒答，`abort_reason` 只会保留下游那个原因（如 `low_confidence`），召回侧的原因只剩 `retriever.last_stats['degraded_legs']` 与日志里能查到——`degraded=true` 仍然成立，只是不指名是哪一路。
 20. **重排不读注入的 settings**：`app/core/reranker.py:341` 的模块级 `rerank(query, chunks, top_n)` 内部走 `get_reranker()` 单例，单例用全局 `get_settings()`；`Diagnoser` 持有自己的 `settings`，但只用于选块与 prompt。生产只有一份配置，行为等价；代价是写单测时必须注入 `rerank_fn`（否则真实重排会读测试环境变量）。没有给它加 `settings` 形参，是因为签名一改，所有假 rerank 注入都要跟着改。
+21. **temperature=0 也不等于可复现**：同一配置隔天再跑一遍全量，full 档 Top-1 从 92.5% 掉到 87.5%，30/50 行的 `causes` 措辞不同（在线 API 的批处理/路由非确定性，不是评测脚本的 bug）。n=40 时 1 条差 2.5 pp；要压掉这层噪声只能加样本量或多次取均值（成本 ×3），当前如实报区间。
+22. **演示脚本退出码 2 表示"门槛未过"，不是崩溃**：`scripts/demo.py` 会在末行打 `FAIL` 并 exit 2（本次实测首字 1270 ms > 1200 ms）。接 CI 时不要把 2 当异常；它不是脚本错误，是 §9 第 3 条那条缺陷的正常反映。
 
 ---
 
@@ -505,9 +631,12 @@ oncall-copilot/
 │   └── obs/          # db / logging / stats（percentile 的单一实现）
 ├── content/          # 255 篇抓取的 Markdown（gitignore）
 ├── data/             # lancedb / bm25.pkl / oncall.db / embed_cache.jsonl（gitignore）
-├── eval/             # dataset.jsonl（50 条）/ scoring.py（评测契约）/ run_eval.py / 探针样本 probe_*.jsonl
+├── eval/             # dataset.jsonl（50 条）/ scoring.py（评测契约）/ run_eval.py
+│                     #   report_d7.*（五档基线）/ report_d9_full.*（重复性重跑）/ results_*.jsonl（逐条明细）
+│                     #   probe_*.jsonl（Query 理解与召回探针样本）
 ├── scripts/          # fetch_corpus.py / smoke_api.py / eval_retrieval_probe.py / bench_stream.py / d5_probe.py / audit_corpus.py / simulate_alert.py / demo.py
-├── tests/
+├── docs/             # 本地设计稿与用例集（gitignore，不随仓库走）：D8-降级路径测试用例集.md
+├── tests/            # 205 个用例函数，parametrize 展开后 242 项（全绿）
 ├── .env.example
 ├── requirements.txt
 └── README.md
@@ -527,9 +656,10 @@ oncall-copilot/
 | D6 | 评测集 + 评测脚本 | ✅ 完成（50 条：40 正 + 10 负，47 个 gold url 逐条核对命中语料；五档变体 + LLM judge 缓存；11 列基线表） |
 | D7 | 5 变体基线 + 调参（唯一止损点） | ✅ 完成（2026-11-07）：五档同口径全量（`eval/report_d7.md`，temperature=0）。full 档 Top-1 **92.5%**、Top-3 **92.5%**、recall@20 97.5%、拒答准确 90.0%、误拒率 7.5%、整卡 P50 3251 / P95 4230 ms、成本 ¥0.0065——除**引用命中 89.2%**（差 1 条样本）与**首字 P50 1233 ms**（差 33 ms）外全部过线。归因见 §9 第 14-18 条 |
 | D8 | 降级路径测试 + pytest | ✅ 完成（2026-11-07）：F1/F2/F4/F5 已修，39 条用例全部 ✅（用例集见 `docs/D8-降级路径测试用例集.md`），pytest 217 passed。收口复核又发现并修掉一处真缺陷：SSE 生产端若在创建事件流时抛异常，sentinel 永不入队、客户端会挂在半开的连接上（S8）；现在创建也进 try，`error` 帧 `stage=internal` 后必定收尾 |
-| D9-D10 | 演示脚本 + 录屏 + README 定稿 | 未开工 |
+| D9 | README 定稿 + 演示脚本 | ✅ 完成（2026-11-08）：Mermaid 架构图、两分钟演示（`simulate_alert.py` 5 场景真实输出 + `demo.py` 分段耗时）、§8.2 重复性与调优历程、§9 新增 20-22 条。途中按用户要求先修掉「`causes=[]` 且 `abstained=false` 也放行」的空卡缺陷（`abort_reason=no_causes`），修后重跑 full 得 Top-1 87.5%，据此把报数改成区间 87.5%–92.5%（§8.2） |
+| D10 | 2 分钟录屏 + 简历条目 + 追问预案 | 未开工 |
 
-设计文档：[技术路线与设计清单.md](../技术路线与设计清单.md)（v1.9）
+设计文档：[技术路线与设计清单.md](../技术路线与设计清单.md)（v2.1）
 
 ---
 
