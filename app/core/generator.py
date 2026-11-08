@@ -992,6 +992,13 @@ def _finalize(
         summary = "模型给出的结论引用了不存在的资料，已全部丢弃（不编造原因）。可参考的原文片段：\n" + _preview_lines(used)
         return _abstain_card(used, "citations_invalid", summary=summary, **common)
 
+    if not causes:
+        # 模型既没说自己拒答、也没给出任何结论：这种"有摘要没结论"的空卡以前会当作
+        # 成功发出去，下游引用校验看到 total=0 直接判 ok=True，等于把"什么都没答出来"
+        # 伪装成通过校验的一次成功诊断。宁可拒答，并留下可区分的 abort_reason。
+        summary = "模型没有给出可校验的结论（causes 为空），已按拒答处理。可参考的原文片段：\n" + _preview_lines(used)
+        return _abstain_card(used, "no_causes", summary=summary, **common)
+
     return _build_card(
         summary=card.summary or (causes[0].title if causes else ""),
         causes=causes,

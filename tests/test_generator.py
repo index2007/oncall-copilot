@@ -260,6 +260,29 @@ def test_fabricated_chunk_ids_become_abstain(monkeypatch, chunks, settings):
     assert {c.chunk_id for c in card.citations} <= allowed
 
 
+def test_empty_causes_without_abstain_becomes_abstain(monkeypatch, chunks, settings):
+    """causes=[] 且 abstained=false 的空结论卡必须转成拒答。
+
+    以前这种卡会按"成功"发出去：卡上有 summary、没有一条 cause，下游引用校验
+    算出 total=0 就判 ok=True，指标上记一次成功作答——实际什么都没答出来。
+    """
+    payload = {
+        "abstained": False,
+        "summary": "看起来是内存问题。",
+        "causes": [],
+        "verify_commands": ["kubectl get pods"],
+        "citations": [{"chunk_id": "k8s-oom-001"}],
+    }
+    _install(monkeypatch, FakeLLM(json.dumps(payload, ensure_ascii=False)))
+    card = generator.generate(QUERY, chunks, settings=settings)
+
+    assert card.abstained is True
+    assert card.abort_reason == "no_causes"
+    assert card.causes == []
+    # 拒答卡仍把候选原文摆出来，方便人自己判断
+    assert "[k8s-oom-001]" in card.summary
+
+
 def test_verify_commands_stay_read_only(monkeypatch, chunks, settings):
     payload = _good_payload()
     payload["verify_commands"] = [
